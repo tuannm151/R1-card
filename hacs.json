@@ -1,0 +1,11 @@
+{
+  "name": "AI BOX WebUI Card",
+  "description": "Full-featured Home Assistant custom card for AI BOX – Media, Control, Chat, EQ, Lighting, Alarms and more.",
+  "content_in_root": true,
+  "render_readme": true,
+  "filename": "aibox-webui-card.js",
+  "country": [
+    "VN"
+  ],
+  "homeassistant": "2023.1.0"
+}
