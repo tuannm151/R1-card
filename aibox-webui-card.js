@@ -1,4 +1,4 @@
-/* AI BOX WebUI Card v6.1.0 for Home Assistant
+/* AI BOX WebUI Card v6.1.1 for Home Assistant
  * + Multi-Room / Multi-Device selector
  * + IP-based tunnel routing (?ip=<device_ip>)
  * Config example:
@@ -169,7 +169,7 @@ class AiBoxCard extends HTMLElement {
     const path = this._roomTunnelPath;
     const base = `wss://${host}${port === 443 ? "" : ":" + port}${path.startsWith("/") ? path : "/" + path}`;
     const ip = this._host;
-    if (ip && ip !== window.location.hostname) {
+    if (ip) {
       return base + (base.includes("?") ? "&" : "?") + "ip=" + encodeURIComponent(ip);
     }
     return base;
@@ -236,7 +236,7 @@ class AiBoxCard extends HTMLElement {
     const path = this._roomSpkTunnelPath;
     const base = `wss://${host}${port === 443 ? "" : ":" + port}${path.startsWith("/") ? path : "/" + path}`;
     const ip = this._host;
-    if (ip && ip !== window.location.hostname) {
+    if (ip) {
       return base + (base.includes("?") ? "&" : "?") + "ip=" + encodeURIComponent(ip);
     }
     return base;
@@ -1598,4 +1598,4 @@ select.form-inp{cursor:pointer}
 customElements.define("aibox-webui-card", AiBoxCard);
 window.customCards = window.customCards || [];
 window.customCards.push({ type: "aibox-webui-card", name: "AI BOX WebUI Card", description: "Full-featured AI BOX control card", preview: true });
-console.log("%c AI BOX WebUI Card v6.1.0-fixed loaded ✅", "color:#a78bfa;font-weight:bold");
+console.log("%c AI BOX WebUI Card v6.1.1 loaded", "color:#a78bfa;font-weight:bold");
