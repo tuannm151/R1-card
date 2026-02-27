@@ -1,14 +1,23 @@
-/* AI BOX WebUI Card v6.0.9 for Home Assistant
- * Beautiful purple UI + Full features + Fixed search
- * Single WS (8082) + temporary WS (8080) for speaker commands
- * Fixes: edge light, chat duplicate, interrupt button
+/* AI BOX WebUI Card v6.1.0 for Home Assistant
+ * + Multi-Room / Multi-Device selector
+ * + IP-based tunnel routing (?ip=<device_ip>)
+ * Config example:
+ *   rooms:
+ *     - name: "Phòng khách"
+ *       host: "192.168.1.100"
+ *     - name: "Phòng ngủ"
+ *       host: "192.168.1.101"
+ *     - name: "Bếp"
+ *       host: "192.168.1.102"
+ * If rooms is not set, falls back to single host: config as before.
  */
 
 const DEFAULTS = {
   host: "", ws_port: 8082, speaker_port: 8080, http_port: 8081,
   tunnel_host: "", tunnel_port: 443, tunnel_path: "/",
   speaker_tunnel_host: "", speaker_tunnel_port: 443, speaker_tunnel_path: "/",
-  mode: "auto", title: "AI BOX", version_badge: "v6.0",
+  mode: "auto", title: "AI BOX", version_badge: "v6.1",
+  rooms: null,
   default_tab: "media", show_background: true,
   reconnect_ms: 1500, connect_timeout_ms: 2500,
 };
@@ -22,7 +31,23 @@ const EQ_LABELS = ['60Hz','230Hz','910Hz','3.6K','14K'];
 class AiBoxCard extends HTMLElement {
   setConfig(config) {
     this._config = { ...DEFAULTS, ...(config || {}) };
-    this._host = (this._config.host || "").trim() || window.location.hostname;
+
+    // ── Multi-room setup ──
+    this._rooms = Array.isArray(this._config.rooms) && this._config.rooms.length
+      ? this._config.rooms.map((r, i) => ({
+          name: r.name || `Loa ${i + 1}`,
+          host: (r.host || "").trim() || window.location.hostname,
+          tunnel_host: (r.tunnel_host || "").trim(),
+          tunnel_port: Number(r.tunnel_port || 443),
+          tunnel_path: (r.tunnel_path || "/").trim() || "/",
+          speaker_tunnel_host: (r.speaker_tunnel_host || "").trim(),
+          speaker_tunnel_port: Number(r.speaker_tunnel_port || 443),
+          speaker_tunnel_path: (r.speaker_tunnel_path || "/").trim() || "/",
+        }))
+      : null;
+
+    if (this._rooms && this._currentRoomIdx === undefined) this._currentRoomIdx = 0;
+    this._applyRoomToConfig();
     this._ws = null; this._wsConnected = false;
     this._spkWs = null; this._spkHb = null; this._spkEqHb = null; this._spkReconnect = null;
     this._activeTab = this._config.default_tab;
@@ -34,6 +59,7 @@ class AiBoxCard extends HTMLElement {
     this._volDragging = false; this._volSendTimer = null; this._volLockTimer = null;
     this._ctrlGuard = 0;
     this._audioGuard = 0;
+    this._stereoGuard = 0;
     this._lastCpuIdle = null; this._lastCpuTotal = null;
 
     this._state = {
@@ -51,7 +77,7 @@ class AiBoxCard extends HTMLElement {
         thumb: "", position: 0, duration: 0, autoNext: true, repeat: false, shuffle: false },
       volume: 0, sys: { cpu: 0, ram: 0 },
       alarms: [], playlists: [], playlistSongs: [],
-      stereo: { enabled: false, receiverEnabled: false, slaveIp: "", syncDelay: 0, scanDevices: [] },
+      stereo: { enabled: false, receiverEnabled: false, slaveIp: "", channel: "left", syncDelay: 0, scanDevices: [] },
       eqEnabled: false,
       eqBands: [0,0,0,0,0],
       bass: { enabled: false, strength: 0 }, loudness: { enabled: false, gain: 0 },
@@ -62,6 +88,74 @@ class AiBoxCard extends HTMLElement {
     if (this._inited) { this._render(); this._bind(); this._connectWsAuto(); }
   }
 
+  _applyRoomToConfig() {
+    if (this._rooms) {
+      const r = this._rooms[this._currentRoomIdx || 0];
+      this._host = r.host;
+      this._roomTunnelHost = r.tunnel_host;
+      this._roomTunnelPort = r.tunnel_port;
+      this._roomTunnelPath = r.tunnel_path;
+      this._roomSpkTunnelHost = r.speaker_tunnel_host;
+      this._roomSpkTunnelPort = r.speaker_tunnel_port;
+      this._roomSpkTunnelPath = r.speaker_tunnel_path;
+    } else {
+      this._host = (this._config.host || "").trim() || window.location.hostname;
+      this._roomTunnelHost = (this._config.tunnel_host || "").trim();
+      this._roomTunnelPort = Number(this._config.tunnel_port || 443);
+      this._roomTunnelPath = (this._config.tunnel_path || "/").trim() || "/";
+      this._roomSpkTunnelHost = (this._config.speaker_tunnel_host || "").trim();
+      this._roomSpkTunnelPort = Number(this._config.speaker_tunnel_port || 443);
+      this._roomSpkTunnelPath = (this._config.speaker_tunnel_path || "/").trim() || "/";
+    }
+  }
+
+  _switchRoom(idx) {
+    if (!this._rooms || idx === this._currentRoomIdx) return;
+    this._currentRoomIdx = idx;
+    this._applyRoomToConfig();
+    this._resetState();
+    this._closeWs();
+    this._renderRoomPills();
+    this._renderMedia(); this._renderVolume();
+    this._renderControlToggles(); this._renderLight();
+    this._renderChatMsgs(); this._renderChatBg(); this._renderTikTok(); this._renderSessionBtn();
+    this._renderSystem(); this._renderAlarms();
+    this._setConnDot(false); this._setConnText("WS");
+    this._toast("🏠 " + this._rooms[idx].name, "success");
+    setTimeout(() => this._connectWsAuto(), 100);
+  }
+
+  _resetState() {
+    this._state = {
+      chat: [], chatBg64: "", tiktokReply: false, chatSessionActive: false, chatSpeaking: false,
+      ledEnabled: null, dlnaOpen: null, airplayOpen: null, bluetoothOn: null,
+      lightEnabled: null, brightness: 100, speed: 50, edgeOn: false, edgeInt: 100,
+      wakeWordEnabled: null, wakeWordSensitivity: null,
+      customAiEnabled: null, voiceId: null, live2dModel: null,
+      otaUrl: null, otaOptions: null,
+      hassConfigured: null, hassUrl: "", hassAgentId: "", hassApiKeyMasked: false,
+      wifiStatus: null, wifiNetworks: [], wifiSaved: [],
+      macAddress: "", macIsCustom: false,
+      media: { source: null, isPlaying: false, title: "Không có nhạc", artist: "---",
+        thumb: "", position: 0, duration: 0, autoNext: true, repeat: false, shuffle: false },
+      volume: 0, sys: { cpu: 0, ram: 0 },
+      alarms: [], playlists: [], playlistSongs: [],
+      stereo: { enabled: false, receiverEnabled: false, slaveIp: "", syncDelay: 0, scanDevices: [] },
+      eqEnabled: false, eqBands: [0,0,0,0,0],
+      bass: { enabled: false, strength: 0 }, loudness: { enabled: false, gain: 0 },
+      bassVol: 231, highVol: 231, surroundW: 40,
+      premium: -1, premQrB64: "",
+    };
+    this._ctrlGuard = 0; this._audioGuard = 0; this._stereoGuard = 0; this._volDragging = false;
+  }
+
+  _renderRoomPills() {
+    const bar = this.querySelector("#roomBar"); if (!bar || !this._rooms) return;
+    bar.querySelectorAll(".room-pill").forEach((pill, i) => {
+      pill.classList.toggle("active", i === (this._currentRoomIdx || 0));
+    });
+  }
+
   set hass(h) { this._hass = h; if (!this._inited) { this._inited = true; this._render(); this._bind(); this._connectWsAuto(); } }
   connectedCallback() { if (this._inited) this._connectWsAuto(); }
   disconnectedCallback() { this._closeWs(); clearInterval(this._progressInterval); }
@@ -70,10 +164,15 @@ class AiBoxCard extends HTMLElement {
   _isHttps() { return window.location.protocol === "https:"; }
   _lanWsUrl() { return `ws://${this._host}:${this._config.ws_port}`; }
   _tunnelWsUrl() {
-    const host = (this._config.tunnel_host || "").trim(); if (!host) return "";
-    const port = Number(this._config.tunnel_port || 443);
-    const path = (this._config.tunnel_path || "/").trim() || "/";
-    return `wss://${host}${port === 443 ? "" : ":" + port}${path.startsWith("/") ? path : "/" + path}`;
+    const host = this._roomTunnelHost; if (!host) return "";
+    const port = this._roomTunnelPort;
+    const path = this._roomTunnelPath;
+    const base = `wss://${host}${port === 443 ? "" : ":" + port}${path.startsWith("/") ? path : "/" + path}`;
+    const ip = this._host;
+    if (ip && ip !== window.location.hostname) {
+      return base + (base.includes("?") ? "&" : "?") + "ip=" + encodeURIComponent(ip);
+    }
+    return base;
   }
 
   async _connectWsAuto() {
@@ -132,10 +231,15 @@ class AiBoxCard extends HTMLElement {
 
   _spkWsUrl() { return `ws://${this._host}:${this._config.speaker_port || 8080}`; }
   _spkTunnelWsUrl() {
-    const host = (this._config.speaker_tunnel_host || "").trim(); if (!host) return "";
-    const port = Number(this._config.speaker_tunnel_port || 443);
-    const path = (this._config.speaker_tunnel_path || "/").trim() || "/";
-    return `wss://${host}${port === 443 ? "" : ":" + port}${path.startsWith("/") ? path : "/" + path}`;
+    const host = this._roomSpkTunnelHost; if (!host) return "";
+    const port = this._roomSpkTunnelPort;
+    const path = this._roomSpkTunnelPath;
+    const base = `wss://${host}${port === 443 ? "" : ":" + port}${path.startsWith("/") ? path : "/" + path}`;
+    const ip = this._host;
+    if (ip && ip !== window.location.hostname) {
+      return base + (base.includes("?") ? "&" : "?") + "ip=" + encodeURIComponent(ip);
+    }
+    return base;
   }
 
   _connectSpkWs() {
@@ -227,20 +331,16 @@ class AiBoxCard extends HTMLElement {
   _handleSpkMsg(raw) {
     let d; try { d = JSON.parse(raw); } catch { return; }
     let s;
-    if (typeof d.data === "string") {
-      try { s = JSON.parse(d.data); } catch { s = d; }
-    } else {
-      s = d.data || d;
-    }
+    if (typeof d.data === "string") { try { s = JSON.parse(d.data); } catch { s = d; } }
+    else { s = d.data || d; }
 
+    // ── Volume ──
     if (!this._volDragging) {
       const vol = s.vol !== undefined ? Number(s.vol) : null;
-      if (vol !== null && vol !== this._state.volume) {
-        this._state.volume = vol;
-        this._renderVolume();
-      }
+      if (vol !== null && vol !== this._state.volume) { this._state.volume = vol; this._renderVolume(); }
     }
 
+    // ── Control toggles (guard 3s sau khi user thao tác) ──
     const ctrlOk = Date.now() - this._ctrlGuard > 3000;
     if (ctrlOk) {
       if (s.dlna_open !== undefined) this._state.dlnaOpen = !!s.dlna_open;
@@ -250,86 +350,69 @@ class AiBoxCard extends HTMLElement {
       if (s.music_light_luma !== undefined) this._state.brightness = Math.max(1, Math.min(200, Math.round(s.music_light_luma)));
       if (s.music_light_chroma !== undefined) this._state.speed = Math.max(1, Math.min(100, Math.round(s.music_light_chroma)));
       if (s.music_light_mode !== undefined) this._state.lightMode = s.music_light_mode;
-      this._renderControlToggles();
-      this._renderLight();
+      this._renderControlToggles(); this._renderLight();
     }
 
-    const audioOk = Date.now() - this._audioGuard > 3000;
+    // ── Audio EQ/Bass/Loudness/Mixer ──
+    const isEqResponse = d.type === "get_eq_config" || d.code === 200;
+    const audioOk = isEqResponse || (Date.now() - this._audioGuard > 3000);
+
     if (audioOk) {
       if (s.eq) {
         const eqEn = s.eq.Eq_Enable !== undefined ? s.eq.Eq_Enable : s.eq.sound_effects_eq_enable;
-        if (eqEn !== undefined) {
-          this._state.eqEnabled = !!eqEn;
-          this._updateSwitch("#swEq", this._state.eqEnabled);
-        }
+        if (eqEn !== undefined) { this._state.eqEnabled = !!eqEn; this._updateSwitch("#swEq", this._state.eqEnabled); }
         if (s.eq.Bands?.list) {
           s.eq.Bands.list.forEach((b, i) => {
-            const lv = b.BandLevel !== undefined ? b.BandLevel : 0;
+            const lv = b.BandLevel ?? 0;
             this._state.eqBands[i] = lv;
             const inp = this.querySelector(`input[data-band="${i}"]`);
             if (inp) inp.value = lv;
           });
         }
       }
-
       if (s.bass) {
-        const bassEn = s.bass.Bass_Enable !== undefined ? s.bass.Bass_Enable : s.bass.sound_effects_bass_enable;
-        if (bassEn !== undefined) {
-          this._state.bass.enabled = !!bassEn;
-          this._updateSwitch("#swBass", this._state.bass.enabled);
-        }
+        const bassEn = s.bass.Bass_Enable ?? s.bass.sound_effects_bass_enable;
+        if (bassEn !== undefined) { this._state.bass.enabled = !!bassEn; this._updateSwitch("#swBass", this._state.bass.enabled); }
         if (s.bass.Current_Strength !== undefined) {
           this._state.bass.strength = s.bass.Current_Strength;
-          const bs = this.querySelector("#bassSlider");
-          if (bs) bs.value = s.bass.Current_Strength;
-          const bv = this.querySelector("#bassVal");
-          if (bv) bv.textContent = Math.round(s.bass.Current_Strength / 10) + "%";
+          const bs = this.querySelector("#bassSlider"); if (bs) bs.value = s.bass.Current_Strength;
+          const bv = this.querySelector("#bassVal"); if (bv) bv.textContent = Math.round(s.bass.Current_Strength / 10) + "%";
         }
       }
-
       if (s.loudness) {
-        const loudEn = s.loudness.Loudness_Enable !== undefined ? s.loudness.Loudness_Enable : s.loudness.sound_effects_loudness_enable;
-        if (loudEn !== undefined) {
-          this._state.loudness.enabled = !!loudEn;
-          this._updateSwitch("#swLoud", this._state.loudness.enabled);
-        }
+        const loudEn = s.loudness.Loudness_Enable ?? s.loudness.sound_effects_loudness_enable;
+        if (loudEn !== undefined) { this._state.loudness.enabled = !!loudEn; this._updateSwitch("#swLoud", this._state.loudness.enabled); }
         if (s.loudness.Current_Gain !== undefined) {
-          const gainRaw = Math.round(s.loudness.Current_Gain);
-          this._state.loudness.gain = gainRaw;
-          const ls = this.querySelector("#loudSlider");
-          if (ls) ls.value = gainRaw;
-          const lv = this.querySelector("#loudVal");
-          if (lv) lv.textContent = (gainRaw / 100).toFixed(1) + " dB";
+          const g = Math.round(s.loudness.Current_Gain);
+          this._state.loudness.gain = g;
+          const ls = this.querySelector("#loudSlider"); if (ls) ls.value = g;
+          const lv = this.querySelector("#loudVal"); if (lv) lv.textContent = (g / 100).toFixed(1) + " dB";
         }
       }
-
       if (s.Mixer) {
         const bvRaw = s.Mixer['DAC Digital Volume L'];
         if (bvRaw !== undefined) {
-          const v = parseInt(bvRaw, 10);
-          this._state.bassVol = v;
+          const v = parseInt(bvRaw, 10); this._state.bassVol = v;
           const bvs = this.querySelector("#bvSlider"); if (bvs) bvs.value = v;
           const bvl = this.querySelector("#bvVal"); if (bvl) bvl.textContent = this._dbStr(v);
         }
         const hvRaw = s.Mixer['DAC Digital Volume R'];
         if (hvRaw !== undefined) {
-          const v = parseInt(hvRaw, 10);
-          this._state.highVol = v;
+          const v = parseInt(hvRaw, 10); this._state.highVol = v;
           const hvs = this.querySelector("#hvSlider"); if (hvs) hvs.value = v;
           const hvl = this.querySelector("#hvVal"); if (hvl) hvl.textContent = this._dbStr(v);
         }
       }
     }
 
+    // ── CPU / RAM từ get_device_info ──
     if (d.type === "get_device_info") {
       const dd = typeof d.data === "string" ? (() => { try { return JSON.parse(d.data); } catch { return {}; } })() : (d.data || {});
-      if (Array.isArray(dd.cpuinfo) && dd.cpuinfo.length > 2) {
-        this._state.sys.cpu = Math.round(dd.cpuinfo[2] * 100 * 10) / 10;
-      }
+      if (Array.isArray(dd.cpuinfo) && dd.cpuinfo.length > 2) this._state.sys.cpu = Math.round(dd.cpuinfo[2] * 100 * 10) / 10;
       if (typeof dd.meminfo === "string") {
         const mTotal = (dd.meminfo.match(/MemTotal:\s+(\d+)/) || [])[1];
-        const mFree  = (dd.meminfo.match(/MemFree:\s+(\d+)/) || [])[1];
-        const mBuf   = (dd.meminfo.match(/Buffers:\s+(\d+)/) || [])[1];
+        const mFree  = (dd.meminfo.match(/MemFree:\s+(\d+)/)  || [])[1];
+        const mBuf   = (dd.meminfo.match(/Buffers:\s+(\d+)/)  || [])[1];
         const mCach  = (dd.meminfo.match(/\bCached:\s+(\d+)/) || [])[1];
         if (mTotal && mFree) {
           const used = parseInt(mTotal) - parseInt(mFree) - (parseInt(mBuf)||0) - (parseInt(mCach)||0);
@@ -378,6 +461,11 @@ class AiBoxCard extends HTMLElement {
     <span class="version">${this._esc(this._config.version_badge)}</span></div>
     <div class="conn-row"><div class="dot" id="connDot"></div><span class="conn-label" id="connText">WS</span></div>
   </div>
+  ${this._rooms ? `
+  <div class="room-bar" id="roomBar">
+    ${this._rooms.map((r,i) => `<button class="room-pill ${i===(this._currentRoomIdx||0)?'active':''}" data-ridx="${i}">
+      <span class="room-pill-dot"></span><span>${this._esc(r.name)}</span></button>`).join('')}
+  </div>` : ''}
   <div class="tabs">
     ${["media","control","chat","system"].map(k=>`<button class="tab ${tab===k?"active":""}" data-tab="${k}">${{media:"♪ Media",control:"⚙ Control",chat:"💬 Chat",system:"✦ System"}[k]}</button>`).join("")}
   </div>
@@ -404,6 +492,13 @@ ha-card{border-radius:20px;overflow:hidden;font-family:'Segoe UI',system-ui,sans
 .dot{width:9px;height:9px;border-radius:50%;background:rgba(239,68,68,.9);box-shadow:0 0 8px rgba(239,68,68,.4);transition:all .3s}
 .dot.on{background:rgba(34,197,94,.9);box-shadow:0 0 10px rgba(34,197,94,.5)}
 .conn-label{font-size:10px;color:rgba(226,232,240,.6)}
+.room-bar{display:flex;gap:6px;overflow-x:auto;padding:0 0 8px;scrollbar-width:none;-webkit-overflow-scrolling:touch;margin-bottom:4px}
+.room-bar::-webkit-scrollbar{display:none}
+.room-pill{display:flex;align-items:center;gap:5px;padding:6px 12px;border-radius:999px;cursor:pointer;font-size:11px;font-weight:700;white-space:nowrap;border:1px solid rgba(148,163,184,.18);background:rgba(2,6,23,.4);color:rgba(226,232,240,.6);transition:all .18s;flex-shrink:0}
+.room-pill:hover{background:rgba(109,40,217,.2);border-color:rgba(139,92,246,.25);color:#c4b5fd}
+.room-pill.active{background:linear-gradient(135deg,rgba(109,40,217,.45),rgba(91,33,182,.4));border-color:rgba(139,92,246,.5);color:#fff;box-shadow:0 2px 14px rgba(109,40,217,.3)}
+.room-pill-dot{width:6px;height:6px;border-radius:50%;background:rgba(148,163,184,.4);transition:all .2s;flex-shrink:0}
+.room-pill.active .room-pill-dot{background:#86efac;box-shadow:0 0 6px rgba(34,197,94,.7)}
 .tabs{display:flex;gap:6px;background:rgba(2,6,23,.5);border:1px solid rgba(148,163,184,.1);padding:5px;border-radius:14px;margin-bottom:12px}
 .tab{flex:1;font-size:11px;padding:8px 6px;border-radius:10px;cursor:pointer;color:rgba(226,232,240,.6);background:transparent;border:none;font-weight:600;transition:all .2s}
 .tab.active{color:#fff;background:rgba(109,40,217,.5);border:1px solid rgba(139,92,246,.3);font-weight:800;box-shadow:0 2px 12px rgba(109,40,217,.25)}
@@ -570,6 +665,7 @@ select.form-inp{cursor:pointer}
 </style>
 `;
     this._setConnDot(this._wsConnected);
+    if (this._rooms) this._renderRoomPills();
     this._renderMedia(); this._renderVolume();
     this._renderControlToggles(); this._renderLight();
     this._renderWakeWord(); this._renderCustomAi(); this._renderVoice();
@@ -670,7 +766,15 @@ select.form-inp{cursor:pointer}
   <div class="ctrl-section">
     <div class="toggle-item"><div class="toggle-left"><div class="tog-name">🔊 Stereo Mode - Loa Mẹ</div></div><div class="sw" id="swStereo"></div></div>
     <div id="stereoMasterOpts" class="hidden">
-      <div class="fx g4 mb6"><input class="form-inp" id="slaveIp" placeholder="IP loa con" style="flex:1" /><button class="form-btn sm" id="btnStereoScan">🔍 Scan</button></div>
+      <div class="fx g4 mb6 aic">
+        <span style="font-size:10px;color:rgba(226,232,240,.5);flex-shrink:0">📢 Kênh:</span>
+        <select class="form-inp" id="masterChannel" style="width:90px;flex-shrink:0">
+          <option value="left">Trái (L)</option>
+          <option value="right">Phải (R)</option>
+        </select>
+        <input class="form-inp" id="slaveIp" placeholder="IP loa con" style="flex:1" />
+        <button class="form-btn sm" id="btnStereoScan">🔍 Scan</button>
+      </div>
       <div id="stereoScanResults"></div>
     </div>
     <div class="toggle-item"><div class="toggle-left"><div class="tog-name">🎧 Stereo Mode - Loa Con</div><div class="tog-desc">Bật để nhận audio từ loa mẹ,chỉ bật 1 trong 2</div></div><div class="sw" id="swStereoRx"></div></div>
@@ -749,8 +853,12 @@ select.form-inp{cursor:pointer}
   }
 
   _panelSystem(tab) {
+    const roomInfo = this._rooms
+      ? `<div class="sys-info-item mb6"><div class="sys-label">Thiết bị đang chọn</div><div class="sys-value" style="color:#a78bfa">${this._esc(this._rooms[this._currentRoomIdx||0]?.name||"—")}</div><div style="font-size:10px;color:rgba(226,232,240,.4);margin-top:3px">${this._esc(this._rooms[this._currentRoomIdx||0]?.host||"—")}</div></div>`
+      : '';
     return `
 <div class="panel ${tab==="system"?"active":""}" id="p-system">
+  ${roomInfo}
   <div class="sys-info-item"><div class="sys-label">CPU</div><div class="sys-value" id="cpuVal">0%</div><div class="stat-bar-wrap"><div class="stat-bar cpu" id="cpuBar" style="width:0%"></div></div></div>
   <div class="sys-info-item"><div class="sys-label">RAM</div><div class="sys-value" id="ramVal">0%</div><div class="stat-bar-wrap"><div class="stat-bar ram" id="ramBar" style="width:0%"></div></div></div>
   <div class="sys-info-item"><div class="sys-label">MAC Address</div>
@@ -775,6 +883,13 @@ select.form-inp{cursor:pointer}
   }
 
   _bind() {
+    // ── Room pills ──
+    if (this._rooms) {
+      this.querySelectorAll(".room-pill").forEach(pill => {
+        pill.onclick = () => this._switchRoom(parseInt(pill.dataset.ridx));
+      });
+    }
+
     this.querySelectorAll(".tab").forEach(b => { b.onclick = () => { this._activeTab = b.dataset.tab; this._render(); this._bind(); if (b.dataset.tab === "control") this._send({ action: "alarm_list" }); }; });
 
     this._on("#seekWrap", null, el => { el.onclick = e => { const m = this._state.media; if (!m.duration) return; const r = el.getBoundingClientRect(); const pos = Math.floor(m.duration * Math.max(0, Math.min(1, (e.clientX - r.left) / r.width))); m.position = pos; this._send({ action: "seek", position: pos }); this._updateProgressOnly(); }; });
@@ -852,7 +967,6 @@ select.form-inp{cursor:pointer}
     this._bindSlider("#brightSlider", "#brightVal", v => { this._ctrlGuard = Date.now(); this._sendSpkMsg(65, v); }, v => v);
     this._bindSlider("#speedSlider", "#speedVal", v => { this._ctrlGuard = Date.now(); this._sendSpkMsg(66, v); }, v => v);
 
-    // ── Edge Light — FIX: type_id trước type ──
     this._bindSwitch("#swEdge", () => {
       this._ctrlGuard = Date.now(); this._state.edgeOn = !this._state.edgeOn;
       this._sendSpk({ type_id: 'Turn on light', type: 'shell', shell: this._state.edgeOn ? 'lights_test set 7fffff8000 ffffff' : 'lights_test set 7fffff8000 0' });
@@ -926,16 +1040,45 @@ select.form-inp{cursor:pointer}
     this._on("#btnVoicePv", () => { const vid = parseInt(this.querySelector("#voiceSel")?.value || 1); const a = new Audio(VBASE + (VFILES[vid] || 'ngocanh') + '.mp3'); a.play().catch(() => this._toast("Không phát được", "error")); });
     const l2d = this.querySelector("#live2dSel"); if (l2d) l2d.onchange = () => this._send({ action: "live2d_set_model", model: l2d.value });
 
+    // ── Stereo Master (FIXED: removed orphaned duplicate) ──
     this._bindSwitch("#swStereo", () => {
-      const en = !this._state.stereo.enabled; this._state.stereo.enabled = en;
+      const en = !this._state.stereo.enabled;
+      this._state.stereo.enabled = en;
+      this._stereoGuard = Date.now();
+      // Mutex: bật master thì tắt receiver
+      if (en && this._state.stereo.receiverEnabled) {
+        this._state.stereo.receiverEnabled = false;
+        this._send({ action: "stereo_enable_receiver", enabled: false });
+        this._updateSwitch("#swStereoRx", false);
+      }
       this._send({ action: "stereo_enable", enabled: en });
-      const opts = this.querySelector("#stereoMasterOpts"); if (opts) opts.classList.toggle("hidden", !en);
+      const opts = this.querySelector("#stereoMasterOpts");
+      if (opts) opts.classList.toggle("hidden", !en);
       this._updateSwitch("#swStereo", en);
     });
     this._on("#btnStereoScan", () => this._send({ action: "stereo_scan" }));
     const sip = this.querySelector("#slaveIp"); if (sip) sip.onchange = () => this._send({ action: "stereo_set_slave_ip", ip: sip.value.trim() });
+    const chSel2 = this.querySelector("#masterChannel");
+    if (chSel2) {
+      chSel2.value = this._state.stereo.channel || "left";
+      chSel2.onchange = () => {
+        this._state.stereo.channel = chSel2.value;
+        this._send({ action: "stereo_set_channel", channel: chSel2.value });
+      };
+    }
+    // ── Stereo Receiver (FIXED: removed orphaned duplicate) ──
     this._bindSwitch("#swStereoRx", () => {
-      const en = !this._state.stereo.receiverEnabled; this._state.stereo.receiverEnabled = en;
+      const en = !this._state.stereo.receiverEnabled;
+      this._state.stereo.receiverEnabled = en;
+      this._stereoGuard = Date.now();
+      // Mutex: bật receiver thì tắt master
+      if (en && this._state.stereo.enabled) {
+        this._state.stereo.enabled = false;
+        this._send({ action: "stereo_enable", enabled: false });
+        const opts = this.querySelector("#stereoMasterOpts");
+        if (opts) opts.classList.add("hidden");
+        this._updateSwitch("#swStereo", false);
+      }
       this._send({ action: "stereo_enable_receiver", enabled: en });
       this._updateSwitch("#swStereoRx", en);
     });
@@ -946,15 +1089,16 @@ select.form-inp{cursor:pointer}
     // ── Chat ──
     this._on("#chatSend", () => this._sendChat());
     const ci = this.querySelector("#chatInp"); if (ci) ci.onkeypress = e => { if (e.key === "Enter") this._sendChat(); };
+    this._on("#btnSession", () => { this._send({ action: "chat_wake_up" }); });
+    this._on("#btnTestMic", () => this._send({ action: "chat_test_mic" }));
 
-    // ── Session button: Wake Up / Interrupt / End Session ──
-    // Session button: luôn gửi chat_wake_up — server tự toggle state
-    this._on("#btnSession", () => {
-      this._send({ action: "chat_wake_up" });
+    this._on("#btnChatClear", () => {
+      this._state.chat = [];
+      this._renderChatMsgs();
+      this._toast("Đã xóa lịch sử chat", "success");
+      this._send({ action: "chat_clear_history" });
     });
 
-    this._on("#btnTestMic", () => this._send({ action: "chat_test_mic" }));
-    this._on("#btnChatClear", () => { this._state.chat = []; this._renderChatMsgs(); });
     this._on("#btnTikTok", () => { const v = !this._state.tiktokReply; this._state.tiktokReply = v; this._renderTikTok(); this._send({ action: "tiktok_reply_toggle", enabled: v }); });
 
     this._on("#btnMacGet", () => this._send({ action: "mac_get" }));
@@ -1040,7 +1184,6 @@ select.form-inp{cursor:pointer}
   _handleMsg(raw) {
     let d; try { d = JSON.parse(raw); } catch { return; }
 
-    // ── Chat message — FIX: dùng queue để tránh duplicate ──
     if (d.type === "chat_message") {
       const isUser = d.message_type === "user";
       const content = d.content || "";
@@ -1048,12 +1191,10 @@ select.form-inp{cursor:pointer}
       return;
     }
 
-    // ── Chat state — dùng button_text/button_enabled từ server ──
     if (d.type === "chat_state") {
       const st = d.state || "";
       this._state.chatSessionActive = ["connecting","listening","speaking","thinking"].includes(st);
       this._state.chatSpeaking = st === "speaking";
-      // Lưu button_text và button_enabled từ server nếu có
       if (d.button_text) this._state.chatBtnText = d.button_text;
       if (d.button_enabled !== undefined) this._state.chatBtnEnabled = d.button_enabled;
       this._renderSessionBtn();
@@ -1061,11 +1202,20 @@ select.form-inp{cursor:pointer}
     }
 
     if (d.type === "chat_history" && Array.isArray(d.messages)) {
-      // Chỉ load history lần đầu khi chat trống
       if (this._state.chat.length === 0) {
-        this._state.chat = d.messages.map(m => ({ type: m.type || m.message_type || "server", content: m.content || "", ts: m.ts || Date.now() }));
+        this._state.chat = d.messages.map(m => ({
+          type: m.type || m.message_type || "server",
+          content: m.content || "",
+          ts: m.ts || Date.now()
+        }));
         this._renderChatMsgs();
       }
+      return;
+    }
+
+    if (d.type === "chat_history_cleared" || d.type === "chat_clear_history_result") {
+      this._state.chat = [];
+      this._renderChatMsgs();
       return;
     }
 
@@ -1098,16 +1248,27 @@ select.form-inp{cursor:pointer}
     if (d.type === "alarm_list" || d.type === "alarm_list_result") { this._state.alarms = d.alarms || []; this._renderAlarms(); return; }
     if (d.type === "alarm_added" || d.type === "alarm_edited" || d.type === "alarm_deleted" || d.type === "alarm_toggled") { this._send({ action: "alarm_list" }); return; }
     if (d.type === "alarm_triggered") { const b = this.querySelector("#alBanner"); if (b) { b.classList.add("show"); b.querySelector(".al-msg").textContent = d.message || "⏰ Báo thức!"; } return; }
-    if (d.type === "stereo_get_state_result" || d.type === "stereo_enable_result" || d.type === "stereo_receiver_enable_result" || d.type === "stereo_receiver_disable_result" || d.type === "stereo_set_sync_delay_result") {
+
+    // ── Stereo state sync (with guard) ──
+    if (d.type === "stereo_get_state_result" || d.type === "stereo_enable_result" ||
+        d.type === "stereo_receiver_enable_result" || d.type === "stereo_receiver_disable_result" ||
+        d.type === "stereo_set_sync_delay_result") {
+      console.log("[AIBOX] Stereo state ←", JSON.stringify(d));
       const st = this._state.stereo;
-      if (d.enabled !== undefined) st.enabled = !!d.enabled;
-      if (d.receiver_enabled !== undefined) st.receiverEnabled = !!d.receiver_enabled;
-      if (d.slave_ip) st.slaveIp = d.slave_ip;
+      const stereoOk = Date.now() - this._stereoGuard > 2000;
+
+      if (stereoOk) {
+        if (d.enabled !== undefined) st.enabled = !!d.enabled;
+        if (d.receiver_enabled !== undefined) st.receiverEnabled = !!d.receiver_enabled;
+      }
+      if (d.slave_ip !== undefined) st.slaveIp = d.slave_ip;
+      if (d.channel !== undefined) st.channel = d.channel;
       if (d.sync_delay_ms !== undefined) st.syncDelay = d.sync_delay_ms;
       this._updateSwitch("#swStereo", st.enabled); this._updateSwitch("#swStereoRx", st.receiverEnabled);
       const opts = this.querySelector("#stereoMasterOpts"); if (opts) opts.classList.toggle("hidden", !st.enabled);
-      const sip = this.querySelector("#slaveIp"); if (sip && d.slave_ip) sip.value = d.slave_ip;
+      const sipEl = this.querySelector("#slaveIp"); if (sipEl) sipEl.value = st.slaveIp;
       const sd = this.querySelector("#syncDelay"); if (sd) sd.value = st.syncDelay;
+      const chSel = this.querySelector("#masterChannel"); if (chSel) chSel.value = st.channel || "left";
       return;
     }
     if (d.type === "stereo_scan_result") {
@@ -1162,8 +1323,8 @@ select.form-inp{cursor:pointer}
       }
       if (typeof dd.meminfo === "string") {
         const mTotal = (dd.meminfo.match(/MemTotal:\s+(\d+)/) || [])[1];
-        const mFree  = (dd.meminfo.match(/MemFree:\s+(\d+)/) || [])[1];
-        const mBuf   = (dd.meminfo.match(/Buffers:\s+(\d+)/) || [])[1];
+        const mFree  = (dd.meminfo.match(/MemFree:\s+(\d+)/)  || [])[1];
+        const mBuf   = (dd.meminfo.match(/Buffers:\s+(\d+)/)  || [])[1];
         const mCach  = (dd.meminfo.match(/\bCached:\s+(\d+)/) || [])[1];
         if (mTotal && mFree) {
           const used = parseInt(mTotal) - parseInt(mFree) - (parseInt(mBuf)||0) - (parseInt(mCach)||0);
@@ -1312,7 +1473,6 @@ select.form-inp{cursor:pointer}
     if (txt) txt.textContent = `TikTok Reply: ${this._state.tiktokReply ? "ON" : "OFF"}`;
   }
 
-  // ── Session button: dùng button_text từ server, fallback theo state ──
   _renderSessionBtn() {
     const btn = this.querySelector("#btnSession"); if (!btn) return;
     const active = this._state.chatSessionActive;
@@ -1320,7 +1480,6 @@ select.form-inp{cursor:pointer}
     const serverText = this._state.chatBtnText || "";
     const serverEnabled = this._state.chatBtnEnabled;
     btn.classList.remove("session-active", "interrupt");
-    // Dùng text từ server nếu có, không thì fallback
     if (serverText) {
       btn.textContent = serverText;
     } else if (!active) {
@@ -1330,13 +1489,11 @@ select.form-inp{cursor:pointer}
     } else {
       btn.textContent = "🟡 End Session";
     }
-    // Style theo state
     if (speaking) {
       btn.classList.add("interrupt");
     } else if (active) {
       btn.classList.add("session-active");
     }
-    // Enabled theo server
     if (serverEnabled !== undefined) btn.disabled = !serverEnabled;
   }
 
@@ -1389,15 +1546,12 @@ select.form-inp{cursor:pointer}
     this._state.sys = { cpu, ram };
   }
 
-  // ── FIX: dùng _sentQueue thay vì _lastSentChat ──
-
   _sendChat() {
     const inp = this.querySelector("#chatInp");
     const t = (inp?.value || "").trim();
     if (!t) return;
     this._send({ action: "chat_send_text", text: t });
     if (inp) inp.value = "";
-  // Không tự hiển thị — chờ server gửi chat_message về
   }
 
   _addChatMsg(content, type) {
@@ -1444,4 +1598,4 @@ select.form-inp{cursor:pointer}
 customElements.define("aibox-webui-card", AiBoxCard);
 window.customCards = window.customCards || [];
 window.customCards.push({ type: "aibox-webui-card", name: "AI BOX WebUI Card", description: "Full-featured AI BOX control card", preview: true });
-console.log("%c AI BOX WebUI Card v6.0.9 loaded ✅", "color:#a78bfa;font-weight:bold");
+console.log("%c AI BOX WebUI Card v6.1.0-fixed loaded ✅", "color:#a78bfa;font-weight:bold");
