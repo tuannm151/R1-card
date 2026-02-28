@@ -1,22 +1,42 @@
-/* AI BOX WebUI Card v6.1.1 for Home Assistant
+/* AI BOX WebUI Card v6.2.0 for Home Assistant
  * + Multi-Room / Multi-Device selector
  * + IP-based tunnel routing (?ip=<device_ip>)
- * Config example:
- *   rooms:
- *     - name: "Phòng khách"
- *       host: "192.168.1.100"
- *     - name: "Phòng ngủ"
- *       host: "192.168.1.101"
- *     - name: "Bếp"
- *       host: "192.168.1.102"
- * If rooms is not set, falls back to single host: config as before.
+ * + Collapsible Audio Engine & Lighting Control
+ * - Removed Stereo Mode
+ * FIX v6.1.3:
+ *   - Tunnel connect/drop loop đã được fix: sau MAX_DROP lần drop → offline hẳn, không loop
+ *   - _dropCount reset đúng khi user bấm "Thử lại" hoặc đổi room
+ *   - HTTP: chỉ thử LAN WS 3 lần rồi dừng
+ *   - HTTPS: chỉ thử tunnel WSS 3 lần rồi dừng
+ * UPDATE v6.1.4:
+ *   - EQ bands phân bổ đều toàn chiều rộng card, có giá trị dB hiển thị trên mỗi cột
+ *   - Waveform media tab chiếm toàn bộ chiều rộng card, hiệu ứng rõ và đẹp hơn
+ * UPDATE v6.1.5:
+ *   - Dynamic audio visualizer: waveform bars chạy bằng requestAnimationFrame
+ *   - Physics-based spring animation: mỗi bar có velocity riêng, chasing target height
+ *   - Beat simulation với BPM ngẫu nhiên, bass/mid/treble band shape thực tế
+ *   - Khi phát nhạc: bars nhảy dynamic theo beat & spectrum; Khi dừng: idle breathing nhẹ
+ * UPDATE v6.1.6:
+ *   - Waveform: bell curve envelope giống web version, 60 bars, rộng và cao hơn
+ *   - Background blur từ thumbnail trải full width trong mc-vis
+ *   - Seekbar nằm trong mc-vis (không tách riêng)
+ *   - Thumb tròn nằm trên góc trái waveform
+ * UPDATE v6.1.6:
+ *   - FIX ALARM: dùng alarm_id (thay vì id) cho toggle/delete/edit đúng protocol server
+ *   - Cập nhật alarm list optimistically (không cần gọi lại alarm_list sau mỗi action)
+ *   - UI alarm: hiển thị #id, ngày trong tuần, nút 🔔 đổi màu xanh khi bật
+ *   - Toast thông báo sau mỗi thao tác thêm/sửa/xóa
+ * UPDATE v6.1.7:
+ *   - FIX: action gửi LÊN server dùng "alarm_id"; response TỪ server dùng "alarm.id"
+ *   - FIX alarm_deleted: server không trả về id trong response → dùng _pendingDeleteId
+ *   - FIX alarm_toggled: fallback reload alarm_list nếu response không có alarm object
  */
 
 const DEFAULTS = {
   host: "", ws_port: 8082, speaker_port: 8080, http_port: 8081,
   tunnel_host: "", tunnel_port: 443, tunnel_path: "/",
   speaker_tunnel_host: "", speaker_tunnel_port: 443, speaker_tunnel_path: "/",
-  mode: "auto", title: "AI BOX", version_badge: "v6.1",
+  mode: "auto", title: "AI BOX",
   rooms: null,
   default_tab: "media", show_background: true,
   reconnect_ms: 1500, connect_timeout_ms: 2500,
@@ -29,10 +49,18 @@ const EQ_PRESETS = { flat:[0,0,0,0,0], bass:[800,400,0,0,0], vocal:[-200,0,600,4
 const EQ_LABELS = ['60Hz','230Hz','910Hz','3.6K','14K'];
 
 class AiBoxCard extends HTMLElement {
+  static getStubConfig() {
+    return { mode: "auto", title: "AI BOX", rooms: [] };
+  }
+
+  static getConfigElement() {
+    return null;
+  }
+
   setConfig(config) {
+    if (!config) throw new Error("Thiếu cấu hình");
     this._config = { ...DEFAULTS, ...(config || {}) };
 
-    // ── Multi-room setup ──
     this._rooms = Array.isArray(this._config.rooms) && this._config.rooms.length
       ? this._config.rooms.map((r, i) => ({
           name: r.name || `Loa ${i + 1}`,
@@ -54,13 +82,20 @@ class AiBoxCard extends HTMLElement {
     this._activeSearchTab = 'songs';
     this._activeAudioTab = 'eq';
     this._activeLightTab = 'main';
+    this._audioOpen = false;
+    this._lightOpen = false;
     this._reconnectTimer = null; this._connectTimeout = null;
     this._progressInterval = null; this._toastTimer = null;
+    this._waveRaf = null; this._waveBars = null;
     this._volDragging = false; this._volSendTimer = null; this._volLockTimer = null;
     this._ctrlGuard = 0;
     this._audioGuard = 0;
-    this._stereoGuard = 0;
     this._lastCpuIdle = null; this._lastCpuTotal = null;
+    this._offline = false;
+    this._retryIn = 0;
+    this._retryCountdownTimer = null;
+    this._failCount = 0;
+    this._dropCount = 0;
 
     this._state = {
       chat: [], chatBg64: "", tiktokReply: false, chatSessionActive: false,
@@ -77,7 +112,6 @@ class AiBoxCard extends HTMLElement {
         thumb: "", position: 0, duration: 0, autoNext: true, repeat: false, shuffle: false },
       volume: 0, sys: { cpu: 0, ram: 0 },
       alarms: [], playlists: [], playlistSongs: [],
-      stereo: { enabled: false, receiverEnabled: false, slaveIp: "", channel: "left", syncDelay: 0, scanDevices: [] },
       eqEnabled: false,
       eqBands: [0,0,0,0,0],
       bass: { enabled: false, strength: 0 }, loudness: { enabled: false, gain: 0 },
@@ -115,6 +149,10 @@ class AiBoxCard extends HTMLElement {
     this._applyRoomToConfig();
     this._resetState();
     this._closeWs();
+    this._offline = false;
+    clearInterval(this._retryCountdownTimer); this._retryCountdownTimer = null;
+    this._failCount = 0;
+    this._dropCount = 0;
     this._renderRoomPills();
     this._renderMedia(); this._renderVolume();
     this._renderControlToggles(); this._renderLight();
@@ -140,13 +178,12 @@ class AiBoxCard extends HTMLElement {
         thumb: "", position: 0, duration: 0, autoNext: true, repeat: false, shuffle: false },
       volume: 0, sys: { cpu: 0, ram: 0 },
       alarms: [], playlists: [], playlistSongs: [],
-      stereo: { enabled: false, receiverEnabled: false, slaveIp: "", syncDelay: 0, scanDevices: [] },
       eqEnabled: false, eqBands: [0,0,0,0,0],
       bass: { enabled: false, strength: 0 }, loudness: { enabled: false, gain: 0 },
       bassVol: 231, highVol: 231, surroundW: 40,
       premium: -1, premQrB64: "",
     };
-    this._ctrlGuard = 0; this._audioGuard = 0; this._stereoGuard = 0; this._volDragging = false;
+    this._ctrlGuard = 0; this._audioGuard = 0; this._volDragging = false;
   }
 
   _renderRoomPills() {
@@ -158,7 +195,7 @@ class AiBoxCard extends HTMLElement {
 
   set hass(h) { this._hass = h; if (!this._inited) { this._inited = true; this._render(); this._bind(); this._connectWsAuto(); } }
   connectedCallback() { if (this._inited) this._connectWsAuto(); }
-  disconnectedCallback() { this._closeWs(); clearInterval(this._progressInterval); }
+  disconnectedCallback() { this._closeWs(); this._stopTabServices(); }
   getCardSize() { return 9; }
 
   _isHttps() { return window.location.protocol === "https:"; }
@@ -169,62 +206,153 @@ class AiBoxCard extends HTMLElement {
     const path = this._roomTunnelPath;
     const base = `wss://${host}${port === 443 ? "" : ":" + port}${path.startsWith("/") ? path : "/" + path}`;
     const ip = this._host;
-    if (ip) {
-      return base + (base.includes("?") ? "&" : "?") + "ip=" + encodeURIComponent(ip);
-    }
+    if (ip) return base + (base.includes("?") ? "&" : "?") + "ip=" + encodeURIComponent(ip);
     return base;
   }
 
-  async _connectWsAuto() {
-    if (this._ws && (this._ws.readyState === 0 || this._ws.readyState === 1)) return;
-    const mode = (this._config.mode || "auto").toLowerCase();
+  _buildCandidates() {
+    const mode  = (this._config.mode || "auto").toLowerCase();
     const https = this._isHttps();
-    const candidates = [];
-    if (mode === "lan") candidates.push({ url: this._lanWsUrl(), label: "LAN WS" });
-    else if (mode === "tunnel") { const t = this._tunnelWsUrl(); if (t) candidates.push({ url: t, label: "TUNNEL WSS" }); }
-    else {
-      if (!https) { candidates.push({ url: this._lanWsUrl(), label: "LAN WS" }); const t = this._tunnelWsUrl(); if (t) candidates.push({ url: t, label: "TUNNEL WSS" }); }
-      else { const t = this._tunnelWsUrl(); if (t) candidates.push({ url: t, label: "TUNNEL WSS" }); }
+    const list  = [];
+    if (mode === "lan") {
+      if (https) {
+        this._toast("HTTPS không hỗ trợ LAN WS, cần cấu hình tunnel_host", "error");
+      } else {
+        list.push({ url: this._lanWsUrl(), label: "LAN WS" });
+      }
+    } else if (mode === "tunnel") {
+      const t = this._tunnelWsUrl(); if (t) list.push({ url: t, label: "TUNNEL WSS" });
+    } else {
+      if (https) {
+        const t = this._tunnelWsUrl(); if (t) list.push({ url: t, label: "TUNNEL WSS" });
+      } else {
+        list.push({ url: this._lanWsUrl(), label: "LAN WS" });
+      }
     }
-    if (!candidates.length) { this._wsConnected = false; this._setConnDot(false); this._toast(https ? "HTTPS: cần tunnel_host WSS" : "Chưa có host", "error"); return; }
-    for (const c of candidates) { if (await this._tryConnect(c.url, c.label)) return; }
-    this._wsConnected = false; this._setConnDot(false); this._toast("Không kết nối được", "error");
-    clearTimeout(this._reconnectTimer);
-    this._reconnectTimer = setTimeout(() => this._connectWsAuto(), this._config.reconnect_ms);
+    return list;
   }
 
-  _tryConnect(url, label) {
-    return new Promise(resolve => {
-      try {
-        if (this._isHttps() && url.startsWith("ws://")) { resolve(false); return; }
-        this._ws = new WebSocket(url);
-        clearTimeout(this._connectTimeout);
-        this._connectTimeout = setTimeout(() => { try { this._ws?.close(); } catch(_) {} resolve(false); }, this._config.connect_timeout_ms);
-        this._ws.onopen = () => {
-          clearTimeout(this._connectTimeout); this._wsConnected = true;
-          this._setConnDot(true); this._setConnText(label);
-          this._toast(`Đã kết nối: ${label}`, "success");
-          this._requestInitial(); this._startProgressTick();
-          this._connectSpkWs();
-          resolve(true);
-        };
-        this._ws.onclose = () => {
-          clearTimeout(this._connectTimeout); this._wsConnected = false;
-          this._setConnDot(false); this._setConnText("WS");
-          clearInterval(this._progressInterval);
-          clearTimeout(this._reconnectTimer);
-          this._reconnectTimer = setTimeout(() => this._connectWsAuto(), this._config.reconnect_ms);
-        };
-        this._ws.onerror = () => {};
-        this._ws.onmessage = ev => this._handleMsg(ev.data);
-      } catch(_) { resolve(false); }
+  _connectWsAuto() {
+    if (this._ws && (this._ws.readyState === 0 || this._ws.readyState === 1)) return;
+    clearTimeout(this._reconnectTimer);
+    const candidates = this._buildCandidates();
+    if (!candidates.length) {
+      this._wsConnected = false; this._setConnDot(false);
+      this._toast(this._isHttps() ? "HTTPS: cần cấu hình tunnel_host" : "Chưa có host", "error");
+      return;
+    }
+    this._doTry(candidates, 0, 1);
+  }
+
+  _doTry(candidates, idx, attempt) {
+    const MAX_PER_URL = 3;
+    clearTimeout(this._reconnectTimer);
+    if (this._ws && (this._ws.readyState === 0 || this._ws.readyState === 1)) return;
+
+    const c = candidates[idx];
+    const total    = candidates.length * MAX_PER_URL;
+    const doneSoFar = idx * MAX_PER_URL + (attempt - 1);
+
+    this._setOffline(true, this._config.reconnect_ms, doneSoFar, total);
+
+    this._tryOnce(c.url, c.label).then(ok => {
+      if (ok) return;
+
+      const newDone = doneSoFar + 1;
+
+      if (attempt < MAX_PER_URL) {
+        this._toast(`${c.label} lần ${attempt}/${MAX_PER_URL} thất bại`, "error");
+        this._setOffline(true, this._config.reconnect_ms, newDone, total);
+        this._reconnectTimer = setTimeout(
+          () => this._doTry(candidates, idx, attempt + 1),
+          this._config.reconnect_ms
+        );
+      } else if (idx + 1 < candidates.length) {
+        const nextLabel = candidates[idx + 1].label;
+        this._toast(`${c.label} hết lượt → thử ${nextLabel}`, "error");
+        this._setOffline(true, this._config.reconnect_ms, newDone, total);
+        this._reconnectTimer = setTimeout(
+          () => this._doTry(candidates, idx + 1, 1),
+          this._config.reconnect_ms
+        );
+      } else {
+        this._wsConnected = false; this._setConnDot(false); this._setConnText("WS");
+        this._toast("Thiết bị offline!", "error");
+        this._setOffline(true, 0, newDone, total);
+      }
     });
   }
 
+  _tryOnce(url, label) {
+    return new Promise(resolve => {
+      let connected = false, settled = false;
+      const finish = (val) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(this._connectTimeout);
+        resolve(val);
+      };
+
+      let ws;
+      try { ws = new WebSocket(url); } catch (_) { finish(false); return; }
+      this._ws = ws;
+
+      this._connectTimeout = setTimeout(() => {
+        if (!connected) { try { ws.close(); } catch(_) {} finish(false); }
+      }, this._config.connect_timeout_ms);
+
+      ws.onopen = () => {
+        connected = true;
+        this._dropCount = 0;
+        this._wsConnected = true;
+        this._chatLoaded = false; // reconnect → load lại history
+        this._setConnDot(true);
+        this._setConnText(label);
+        this._setOffline(false);
+        this._toast("Đã kết nối: " + label, "success");
+        this._requestInitial(); // load data cho tab đang active
+        finish(true);
+      };
+
+      ws.onclose = () => {
+        if (!connected) {
+          this._ws = null;
+          finish(false);
+        } else {
+          this._wsConnected = false;
+          this._setConnDot(false);
+          this._setConnText("WS");
+          this._stopTabServices();
+          clearTimeout(this._reconnectTimer);
+
+          const MAX_DROP = 3;
+          this._dropCount = (this._dropCount || 0) + 1;
+
+          if (this._dropCount >= MAX_DROP) {
+            this._dropCount = 0;
+            this._toast("Thiết bị offline sau " + MAX_DROP + " lần drop!", "error");
+            this._setOffline(true, 0, MAX_DROP, MAX_DROP);
+          } else {
+            this._toast(`Drop ${this._dropCount}/${MAX_DROP} — thiết bị không phản hồi`, "error");
+            this._setOffline(true, 0, this._dropCount, MAX_DROP);
+          }
+        }
+      };
+
+      ws.onerror = () => {};
+      ws.onmessage = ev => this._handleMsg(ev.data);
+    });
+  }
+
+  _tryConnect(url, label) { return this._tryOnce(url, label); }
+
   _closeWs() {
-    clearTimeout(this._reconnectTimer); clearTimeout(this._connectTimeout); clearInterval(this._progressInterval);
+    clearTimeout(this._reconnectTimer); clearTimeout(this._connectTimeout);
+    clearInterval(this._retryCountdownTimer); this._retryCountdownTimer = null;
+    this._stopTabServices();
     try { this._ws?.close(); } catch(_) {} this._ws = null; this._wsConnected = false; this._setConnDot(false);
     this._closeSpkWs();
+    this._stopWaveform();
   }
 
   _send(obj) { if (this._ws?.readyState === 1) this._ws.send(JSON.stringify(obj)); }
@@ -236,9 +364,7 @@ class AiBoxCard extends HTMLElement {
     const path = this._roomSpkTunnelPath;
     const base = `wss://${host}${port === 443 ? "" : ":" + port}${path.startsWith("/") ? path : "/" + path}`;
     const ip = this._host;
-    if (ip) {
-      return base + (base.includes("?") ? "&" : "?") + "ip=" + encodeURIComponent(ip);
-    }
+    if (ip) return base + (base.includes("?") ? "&" : "?") + "ip=" + encodeURIComponent(ip);
     return base;
   }
 
@@ -250,10 +376,9 @@ class AiBoxCard extends HTMLElement {
     else { url = this._spkWsUrl(); }
     try {
       this._spkWs = new WebSocket(url);
-      this._spkWs.onopen = () => { console.log("[AIBOX] Speaker WS connected:", url); this._startSpkHeartbeat(); };
+      this._spkWs.onopen = () => { this._startSpkHeartbeat(); };
       this._spkWs.onmessage = ev => this._handleSpkMsg(ev.data);
       this._spkWs.onclose = () => {
-        console.log("[AIBOX] Speaker WS closed");
         this._stopSpkHeartbeat();
         clearTimeout(this._spkReconnect);
         this._spkReconnect = setTimeout(() => this._connectSpkWs(), 3000);
@@ -288,13 +413,8 @@ class AiBoxCard extends HTMLElement {
   }
 
   _sendSpk(obj) {
-    if (this._spkWs?.readyState === 1) {
-      this._spkWs.send(JSON.stringify(obj));
-      console.log("[AIBOX] SpkWS →", JSON.stringify(obj).substring(0, 120));
-    } else {
-      console.warn("[AIBOX] SpkWS not connected, fallback to plus WS:", JSON.stringify(obj).substring(0, 120));
-      this._send(obj);
-    }
+    if (this._spkWs?.readyState === 1) { this._spkWs.send(JSON.stringify(obj)); }
+    else { this._send(obj); }
   }
 
   _sendSpkMsg(arg1, arg2, obj) {
@@ -324,7 +444,7 @@ class AiBoxCard extends HTMLElement {
         ws.send(JSON.stringify({ type: "send_message", what: 4, arg1: 5, arg2: vol }));
         setTimeout(() => { try { ws.close(); } catch(_) {} }, 500);
       };
-      ws.onerror = () => { this._send({ action: "set_volume", value: vol }); this._send({ action: "set_volume", volume: vol }); };
+      ws.onerror = () => { this._send({ action: "set_volume", value: vol }); };
     } catch(e) { this._send({ action: "set_volume", value: vol }); }
   }
 
@@ -334,13 +454,11 @@ class AiBoxCard extends HTMLElement {
     if (typeof d.data === "string") { try { s = JSON.parse(d.data); } catch { s = d; } }
     else { s = d.data || d; }
 
-    // ── Volume ──
     if (!this._volDragging) {
       const vol = s.vol !== undefined ? Number(s.vol) : null;
       if (vol !== null && vol !== this._state.volume) { this._state.volume = vol; this._renderVolume(); }
     }
 
-    // ── Control toggles (guard 3s sau khi user thao tác) ──
     const ctrlOk = Date.now() - this._ctrlGuard > 3000;
     if (ctrlOk) {
       if (s.dlna_open !== undefined) this._state.dlnaOpen = !!s.dlna_open;
@@ -353,7 +471,6 @@ class AiBoxCard extends HTMLElement {
       this._renderControlToggles(); this._renderLight();
     }
 
-    // ── Audio EQ/Bass/Loudness/Mixer ──
     const isEqResponse = d.type === "get_eq_config" || d.code === 200;
     const audioOk = isEqResponse || (Date.now() - this._audioGuard > 3000);
 
@@ -368,6 +485,7 @@ class AiBoxCard extends HTMLElement {
             const inp = this.querySelector(`input[data-band="${i}"]`);
             if (inp) inp.value = lv;
           });
+          this._renderEqBands();
         }
       }
       if (s.bass) {
@@ -405,7 +523,6 @@ class AiBoxCard extends HTMLElement {
       }
     }
 
-    // ── CPU / RAM từ get_device_info ──
     if (d.type === "get_device_info") {
       const dd = typeof d.data === "string" ? (() => { try { return JSON.parse(d.data); } catch { return {}; } })() : (d.data || {});
       if (Array.isArray(dd.cpuinfo) && dd.cpuinfo.length > 2) this._state.sys.cpu = Math.round(dd.cpuinfo[2] * 100 * 10) / 10;
@@ -424,12 +541,79 @@ class AiBoxCard extends HTMLElement {
   }
 
   _requestInitial() {
-    ["led_get_state","ota_get","hass_get","wifi_get_status","wifi_get_saved",
-     "wake_word_get_enabled","wake_word_get_sensitivity",
-     "custom_ai_get_enabled","voice_id_get","live2d_get_model",
-     "chat_get_history","get_chat_background","get_info","alarm_list",
-     "stereo_get_state","get_premium_status","mac_get"
-    ].forEach(a => this._send({ action: a }));
+    // Kết nối spkWs ngay — heartbeat 950ms chạy liên tục bất kể tab nào
+    if (!this._spkWs || this._spkWs.readyState > 1) this._connectSpkWs();
+    else this._startSpkHeartbeat();
+    // Chỉ load data cho tab đang active — các tab khác load khi kích vào
+    this._loadTab(this._activeTab, true);
+  }
+
+  // Load dữ liệu cho từng tab, stop services của tab cũ
+  _loadTab(tab, isFirst = false) {
+    // ── Stop services của tất cả tab ──────────────────────────
+    this._stopTabServices();
+
+    // ── Media tab ─────────────────────────────────────────────
+    if (tab === 'media') {
+      this._send({ action: 'get_info' });   // volume, playback state
+      this._startProgressTick();
+      this._startWaveform();
+      // spkWs đã luôn kết nối từ _requestInitial, không cần start lại
+
+    // ── Control tab ───────────────────────────────────────────
+    } else if (tab === 'control') {
+      this._send({ action: 'get_info' });  // ngay lập tức
+      this._send({ action: 'alarm_list' });
+      this._send({ action: 'led_get_state' });
+      this._send({ action: 'wake_word_get_enabled' });
+      this._send({ action: 'wake_word_get_sensitivity' });
+      this._send({ action: 'custom_ai_get_enabled' });
+      this._send({ action: 'voice_id_get' });
+      this._send({ action: 'live2d_get_model' });
+      // Poll nhẹ sau đó
+      this._ctrlPoll = setInterval(() => {
+        this._send({ action: 'led_get_state' });
+        this._send({ action: 'get_info' });
+      }, 5000);
+
+    // ── Chat tab ──────────────────────────────────────────────
+    } else if (tab === 'chat') {
+      this._send({ action: 'get_info' });
+      if (!this._chatLoaded) {
+        this._send({ action: 'chat_get_history' });
+      }
+      this._send({ action: 'get_chat_background' });
+      this._send({ action: 'custom_ai_get_enabled' });
+
+    // ── System tab ────────────────────────────────────────────
+    } else if (tab === 'system') {
+      this._send({ action: 'get_info' });
+      this._send({ action: 'get_device_info' });
+      this._send({ action: 'ota_get' });
+      this._send({ action: 'hass_get' });
+      this._send({ action: 'wifi_get_status' });
+      this._send({ action: 'wifi_get_saved' });
+      this._send({ action: 'mac_get' });
+      this._send({ action: 'get_premium_status' });
+      // Poll system stats mỗi 3s chỉ khi đang xem System
+      this._sysPoll = setInterval(() => {
+        this._send({ action: 'get_info' });
+        this._send({ action: 'get_device_info' });
+      }, 3000);
+    }
+  }
+
+  // Dừng TẤT CẢ background services của tab
+  _stopTabServices() {
+    // Waveform + progress — chỉ dùng ở Media
+    this._stopWaveform();
+    clearInterval(this._progressInterval);  this._progressInterval = null;
+    // Control poll
+    clearInterval(this._ctrlPoll);  this._ctrlPoll = null;
+    // System poll
+    clearInterval(this._sysPoll);   this._sysPoll = null;
+    // SpkWs heartbeat KHÔNG dừng ở đây — luôn chạy sau khi connect
+    // Chỉ dừng khi WS disconnect (_closeWs / onclose)
   }
 
   _startProgressTick() {
@@ -440,11 +624,198 @@ class AiBoxCard extends HTMLElement {
     }, 1000);
   }
 
+  // ===== Dynamic Audio Visualizer Engine v6.1.5 =====
+  _startWaveform() {
+    this._stopWaveform();
+    const BAR_COUNT = 60;
+    const MAX_H = 72;
+
+    // Smooth per-bar state
+    const cur = new Float32Array(BAR_COUNT).fill(3);
+    const vel = new Float32Array(BAR_COUNT).fill(0);
+
+    // Bell curve envelope — shape cố định, xác định chiều cao tối đa mỗi bar
+    const envelope = new Float32Array(BAR_COUNT).map((_, i) => {
+      const x = i / (BAR_COUNT - 1);
+      const d = Math.abs(x - 0.5);
+      return 0.15 + 0.85 * Math.exp(-Math.pow(d / 0.35, 2));
+    });
+
+    // Shared oscillators — tất cả bars đều "nhìn" vào cùng wave
+    // Wave 1: sóng chậm, tạo hình dạng chính
+    // Wave 2: sóng nhanh hơn, tạo răng cưa/chi tiết
+    // Wave 3: traveling wave từ trái → phải (như âm thanh lan truyền)
+    let w1 = 0, w2 = 0, w3 = 0;       // phase của 3 wave chính
+    let beatAmp = 0, beatTgt = 0;
+    let bpm = 118 + Math.random() * 30;
+    let frameSinceBeat = 0, lastTs = 0;
+
+    const tick = (ts) => {
+      this._waveRaf = requestAnimationFrame(tick);
+      const dt = Math.min((ts - (lastTs || ts)) / 16.67, 3);
+      lastTs = ts;
+      const isPlaying = this._state.media.isPlaying;
+
+      // Tiến phase các wave chung
+      w1 += 0.018 * dt;   // chậm ~1.1Hz
+      w2 += 0.041 * dt;   // nhanh ~2.5Hz
+      w3 += 0.027 * dt;   // traveling wave
+
+      // Beat simulation
+      const fpb = (60 / bpm) * 60;
+      frameSinceBeat += dt;
+      if (frameSinceBeat >= fpb) {
+        frameSinceBeat -= fpb;
+        beatTgt = isPlaying ? (0.6 + Math.random() * 0.4) : 0;
+        bpm += (Math.random() - 0.5) * 4;
+        bpm = Math.max(85, Math.min(170, bpm));
+      }
+      beatAmp += (beatTgt - beatAmp) * 0.3 * dt;
+      beatTgt  *= Math.pow(0.82, dt);
+
+      for (let i = 0; i < BAR_COUNT; i++) {
+        const env = envelope[i];
+        // Vị trí chuẩn hóa 0..1
+        const x = i / (BAR_COUNT - 1);
+
+        let tgt;
+        if (isPlaying) {
+          // Tất cả bars dùng CÙNG wave, chỉ khác pha theo vị trí (traveling effect)
+          const travelOffset = x * Math.PI * 3.5;  // sóng lan từ trái sang phải
+          const s1 = Math.sin(w1 * 2 * Math.PI + travelOffset) * 0.5 + 0.5;
+          const s2 = Math.sin(w2 * 2 * Math.PI + travelOffset * 1.7) * 0.3 + 0.3;
+          const s3 = Math.abs(Math.sin(w3 * 2 * Math.PI + travelOffset * 0.8)); // rectified
+
+          // Beat: toàn bộ spectrum bật lên cùng lúc (đặc trưng của beat)
+          const beatPulse = beatAmp * (0.6 + 0.4 * Math.sin(w1 * Math.PI * 4));
+
+          // Kết hợp — envelope kiểm soát biên độ theo vị trí
+          const combined = (s1 * 0.45 + s2 * 0.30 + s3 * 0.15 + beatPulse * 0.40) * env;
+          tgt = 4 + combined * MAX_H;
+
+          // Micro-spike lúc beat hit (chỉ bars có envelope cao)
+          if (frameSinceBeat < 2 && Math.random() < 0.25 * env)
+            tgt = Math.min(MAX_H, tgt * (1.2 + Math.random() * 0.3));
+        } else {
+          // Idle: sóng nhẹ nhàng đồng bộ, giữ hình bell curve
+          tgt = 3 + Math.sin(w1 * 2 * Math.PI + x * Math.PI) * 3 * env;
+        }
+
+        // Spring damping physics
+        vel[i] = vel[i] * 0.68 + (tgt - cur[i]) * 0.26 * dt;
+        cur[i] = Math.max(2, Math.min(MAX_H, cur[i] + vel[i]));
+      }
+
+      const bars = this._waveBars;
+      if (!bars || bars.length !== BAR_COUNT) {
+        const wv = this.querySelector('#waveform');
+        if (wv) this._waveBars = wv.querySelectorAll('.wv-bar');
+        return;
+      }
+      for (let i = 0; i < BAR_COUNT; i++) {
+        bars[i].style.height = cur[i] + 'px';
+      }
+    };
+
+    const wv = this.querySelector('#waveform');
+    if (wv) this._waveBars = wv.querySelectorAll('.wv-bar');
+    this._waveRaf = requestAnimationFrame(tick);
+  }
+
+  _stopWaveform() {
+    if (this._waveRaf) { cancelAnimationFrame(this._waveRaf); this._waveRaf = null; }
+    this._waveBars = null;
+  }
+  // ===== End Visualizer Engine =====
+
   _fmtTime(s) { s = Math.max(0, Math.floor(Number(s || 0))); return `${Math.floor(s/60)}:${String(s%60).padStart(2,"0")}`; }
   _esc(s) { return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
   _dbStr(v) { const d = v - 231; return (d >= 0 ? "+" : "") + d + " dB"; }
   _setConnDot(on) { const d = this.querySelector("#connDot"); if (d) d.classList.toggle("on", !!on); }
   _setConnText(t) { const el = this.querySelector("#connText"); if (el) el.textContent = t || "WS"; }
+
+  _setOffline(offline, retryMs = 0, done = 0, total = 0) {
+    this._offline = offline;
+    this._offlineDone = done;
+    this._offlineTotal = total;
+    clearInterval(this._retryCountdownTimer);
+    this._retryCountdownTimer = null;
+
+    this._updateRoomPillState();
+
+    const overlay = this.querySelector("#offlineOverlay");
+    if (!overlay) return;
+
+    if (!offline) { overlay.style.display = "none"; return; }
+
+    overlay.style.display = "flex";
+    this._retryIn = Math.ceil(retryMs / 1000);
+    this._renderOfflineOverlay(overlay);
+
+    if (retryMs > 0) {
+      this._retryCountdownTimer = setInterval(() => {
+        this._retryIn = Math.max(0, this._retryIn - 1);
+        const ov = this.querySelector("#offlineOverlay");
+        if (ov) this._renderOfflineOverlay(ov);
+        if (this._retryIn <= 0) { clearInterval(this._retryCountdownTimer); this._retryCountdownTimer = null; }
+      }, 1000);
+    }
+  }
+
+  _renderOfflineOverlay(overlay) {
+    const roomName = this._rooms
+      ? this._rooms[this._currentRoomIdx || 0]?.name || "Thiết bị"
+      : (this._config.title || "Thiết bị");
+    const host = this._host || "";
+    const done  = this._offlineDone  || 0;
+    const total = this._offlineTotal || 0;
+    const isPermanent = total > 0 && done >= total;
+
+    const progressBar = total > 0
+      ? `<div style="width:160px;height:4px;background:rgba(148,163,184,.15);border-radius:999px;margin:6px auto 0">
+           <div style="height:100%;width:${Math.round(done/total*100)}%;background:${isPermanent?'#ef4444':'#a78bfa'};border-radius:999px;transition:width .3s"></div>
+         </div>
+         <div style="font-size:10px;color:rgba(226,232,240,.4);margin-top:3px">${done}/${total} lần thử</div>`
+      : '';
+
+    overlay.innerHTML = `
+      <div class="offline-box">
+        <div class="offline-icon">${isPermanent ? "🔌" : "📡"}</div>
+        <div class="offline-title" style="color:${isPermanent ? "#fca5a5" : "#fcd34d"}">${isPermanent ? "Thiết bị offline" : "Đang kết nối lại..."}</div>
+        <div class="offline-room">${this._esc(roomName)}</div>
+        <div class="offline-host">${this._esc(host)}</div>
+        ${progressBar}
+        <div class="offline-retry" style="margin-top:6px">
+          ${isPermanent
+            ? `<span style="color:rgba(226,232,240,.45);font-size:11px">Đã thử hết ${total} lần — không kết nối được</span>`
+            : (this._retryIn > 0
+                ? `Thử lại sau <b>${this._retryIn}s</b>`
+                : `Đang thử kết nối...`)
+          }
+        </div>
+        <button class="offline-btn" id="btnOfflineRetry">🔄 Thử lại</button>
+      </div>`;
+    const btn = overlay.querySelector("#btnOfflineRetry");
+    if (btn) btn.onclick = () => {
+      clearTimeout(this._reconnectTimer);
+      clearInterval(this._retryCountdownTimer);
+      this._retryCountdownTimer = null;
+      this._offlineDone = 0; this._offlineTotal = 0;
+      this._dropCount = 0;
+      this._connectWsAuto();
+    };
+  }
+
+  _updateRoomPillState() {
+    if (!this._rooms) return;
+    const bar = this.querySelector("#roomBar"); if (!bar) return;
+    bar.querySelectorAll(".room-pill").forEach((pill, i) => {
+      const isActive = i === (this._currentRoomIdx || 0);
+      pill.classList.toggle("active", isActive);
+      pill.classList.toggle("offline", isActive && this._offline);
+    });
+  }
+
   _toast(msg, type = "") {
     const el = this.querySelector("#toast"); if (!el) return;
     el.textContent = msg; el.className = `toast on${type ? " " + type : ""}`;
@@ -457,8 +828,7 @@ class AiBoxCard extends HTMLElement {
 <ha-card>
 <div class="wrap">
   <div class="header">
-    <div class="brand"><div class="badge-icon">👑</div><span class="title-text">${this._esc(this._config.title)}</span>
-    <span class="version">${this._esc(this._config.version_badge)}</span></div>
+    <div class="brand"><div class="badge-icon">👑</div><span class="title-text">${this._esc(this._config.title)}</span></div>
     <div class="conn-row"><div class="dot" id="connDot"></div><span class="conn-label" id="connText">WS</span></div>
   </div>
   ${this._rooms ? `
@@ -470,6 +840,7 @@ class AiBoxCard extends HTMLElement {
     ${["media","control","chat","system"].map(k=>`<button class="tab ${tab===k?"active":""}" data-tab="${k}">${{media:"♪ Media",control:"⚙ Control",chat:"💬 Chat",system:"✦ System"}[k]}</button>`).join("")}
   </div>
   <div class="body">
+    <div class="offline-overlay" id="offlineOverlay" style="display:none"></div>
     ${this._panelMedia(tab)}
     ${this._panelControl(tab)}
     ${this._panelChat(tab)}
@@ -499,6 +870,19 @@ ha-card{border-radius:20px;overflow:hidden;font-family:'Segoe UI',system-ui,sans
 .room-pill.active{background:linear-gradient(135deg,rgba(109,40,217,.45),rgba(91,33,182,.4));border-color:rgba(139,92,246,.5);color:#fff;box-shadow:0 2px 14px rgba(109,40,217,.3)}
 .room-pill-dot{width:6px;height:6px;border-radius:50%;background:rgba(148,163,184,.4);transition:all .2s;flex-shrink:0}
 .room-pill.active .room-pill-dot{background:#86efac;box-shadow:0 0 6px rgba(34,197,94,.7)}
+.room-pill.offline{background:rgba(239,68,68,.15);border-color:rgba(239,68,68,.35);color:rgba(252,165,165,.9)}
+.room-pill.offline .room-pill-dot{background:rgba(239,68,68,.9);box-shadow:0 0 6px rgba(239,68,68,.6);animation:offBlink 1.2s ease-in-out infinite}
+@keyframes offBlink{0%,100%{opacity:1}50%{opacity:.3}}
+.offline-overlay{position:absolute;inset:0;z-index:50;background:rgba(6,9,18,.92);border-radius:12px;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(4px)}
+.offline-box{text-align:center;padding:24px 20px;display:flex;flex-direction:column;align-items:center;gap:8px}
+.offline-icon{font-size:40px;animation:offBlink 1.5s ease-in-out infinite}
+.offline-title{font-size:16px;font-weight:900;color:#fca5a5;letter-spacing:.5px}
+.offline-room{font-size:13px;font-weight:700;color:#e2e8f0}
+.offline-host{font-size:10px;color:rgba(226,232,240,.4);font-family:monospace}
+.offline-retry{font-size:12px;color:rgba(226,232,240,.6);margin-top:4px}
+.offline-retry b{color:#fbbf24}
+.offline-btn{margin-top:8px;padding:10px 24px;border-radius:12px;cursor:pointer;font-size:12px;font-weight:700;border:1px solid rgba(139,92,246,.4);background:linear-gradient(135deg,rgba(109,40,217,.5),rgba(91,33,182,.4));color:#fff;transition:all .15s}
+.offline-btn:hover{box-shadow:0 2px 16px rgba(109,40,217,.5);transform:translateY(-1px)}
 .tabs{display:flex;gap:6px;background:rgba(2,6,23,.5);border:1px solid rgba(148,163,184,.1);padding:5px;border-radius:14px;margin-bottom:12px}
 .tab{flex:1;font-size:11px;padding:8px 6px;border-radius:10px;cursor:pointer;color:rgba(226,232,240,.6);background:transparent;border:none;font-weight:600;transition:all .2s}
 .tab.active{color:#fff;background:rgba(109,40,217,.5);border:1px solid rgba(139,92,246,.3);font-weight:800;box-shadow:0 2px 12px rgba(109,40,217,.25)}
@@ -508,7 +892,7 @@ ha-card{border-radius:20px;overflow:hidden;font-family:'Segoe UI',system-ui,sans
 .panel.active{display:block;animation:fadeIn .2s ease}
 @keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
 .media-card{border-radius:16px;overflow:hidden;border:1px solid rgba(148,163,184,.12);background:linear-gradient(180deg,rgba(30,20,60,.9),rgba(10,15,30,.95));padding:14px;margin-bottom:12px}
-.mc-header{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:12px}
+.mc-header{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px}
 .mc-info{flex:1;min-width:0}
 .mc-title{font-size:15px;font-weight:900;color:#f1f5f9;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .mc-artist{font-size:11px;color:rgba(226,232,240,.55);margin-top:2px}
@@ -516,17 +900,79 @@ ha-card{border-radius:20px;overflow:hidden;font-family:'Segoe UI',system-ui,sans
 .mc-source{font-size:9px;padding:3px 8px;border-radius:6px;background:rgba(109,40,217,.3);border:1px solid rgba(139,92,246,.3);color:#c4b5fd;font-weight:800;letter-spacing:1px}
 .mc-icon-btn{width:28px;height:28px;border-radius:50%;border:1px solid rgba(148,163,184,.15);background:transparent;color:rgba(226,232,240,.5);cursor:pointer;font-size:13px;display:grid;place-items:center;transition:all .15s}
 .mc-icon-btn:hover{background:rgba(109,40,217,.2)}.mc-icon-btn.active-btn{color:#86efac;border-color:rgba(34,197,94,.3)}
-.mc-body{display:flex;align-items:center;gap:14px;margin-bottom:12px}
-.mc-thumb-wrap{width:90px;height:90px;border-radius:50%;overflow:hidden;border:3px solid rgba(139,92,246,.35);box-shadow:0 0 20px rgba(109,40,217,.3);flex-shrink:0}
+/* ===== UPDATED v6.1.6: Web-style waveform visual area ===== */
+.mc-vis{
+  position:relative;border-radius:14px;overflow:hidden;margin-bottom:0;
+  height:156px;border:1px solid rgba(139,92,246,.2);
+  background:#080416;display:flex;flex-direction:column;
+}
+/* Background blur từ thumbnail — giống web version */
+.mc-bg{
+  position:absolute;inset:0;z-index:0;
+  background-size:cover;background-position:center;
+  filter:blur(28px) brightness(.38) saturate(1.4);
+  transform:scale(1.12);
+  opacity:0;transition:opacity .6s ease;
+}
+.mc-bg.show{opacity:1}
+/* Overlay tối nhẹ để bars nổi */
+.mc-vis::after{
+  content:'';position:absolute;inset:0;z-index:1;
+  background:linear-gradient(to bottom,rgba(4,2,12,.25) 0%,rgba(4,2,12,.55) 100%);
+  pointer-events:none;
+}
+/* Hàng trên: thumb tròn + title area */
+.mc-top{
+  display:flex;align-items:center;gap:11px;
+  padding:12px 14px 0 14px;position:relative;z-index:2;flex-shrink:0;
+}
+.mc-thumb-wrap{
+  width:72px;height:72px;border-radius:50%;overflow:hidden;flex-shrink:0;
+  border:2.5px solid rgba(139,92,246,.55);
+  box-shadow:0 0 20px rgba(109,40,217,.5);position:relative;
+}
 .mc-thumb{width:100%;height:100%;object-fit:cover}
-.mc-thumb.spin{animation:sp 10s linear infinite}@keyframes sp{to{transform:rotate(360deg)}}
-.mc-thumb-fb{width:100%;height:100%;display:grid;place-items:center;background:rgba(109,40,217,.2);font-size:32px}
-.mc-waveform-area{flex:1;min-width:0;display:flex;align-items:center}
-.waveform{display:flex;align-items:flex-end;justify-content:center;gap:2px;height:70px;width:100%}.waveform.off .wv-bar{animation:none!important;height:3px!important;opacity:.2}
-.wv-bar{width:3px;flex-shrink:0;background:linear-gradient(to top,rgba(109,40,217,.6),#a78bfa);border-radius:1.5px;animation:wvA .6s ease-in-out infinite alternate;animation-delay:calc(var(--i)*0.04s)}
-@keyframes wvA{0%{height:4px;opacity:.3}100%{height:100%;opacity:.9}}
+.mc-thumb.spin{animation:sp 12s linear infinite}@keyframes sp{to{transform:rotate(360deg)}}
+.mc-thumb-fb{width:100%;height:100%;display:grid;place-items:center;background:rgba(109,40,217,.18);font-size:28px}
+/* Waveform area — full width, fills remaining space */
+.waveform-wrap{
+  flex:1;position:relative;z-index:2;display:flex;align-items:flex-end;
+  padding:0 10px 0 10px;overflow:hidden;min-height:0;
+}
+.waveform{
+  display:flex;align-items:flex-end;justify-content:space-between;
+  width:100%;height:100%;gap:0;
+}
+/* Progress bar nằm trong mc-vis, ở đáy */
+.mc-seek-wrap{
+  position:relative;z-index:2;padding:4px 12px 10px 12px;flex-shrink:0;
+}
+.mc-seek-row{display:flex;align-items:center;gap:7px}
+.mc-seek-bar{
+  flex:1;height:3px;border-radius:2px;background:rgba(255,255,255,.12);
+  cursor:pointer;position:relative;overflow:visible;
+}
+.mc-seek-fill{
+  height:100%;background:linear-gradient(to right,#6d28d9,#a78bfa);
+  border-radius:2px;transition:width .4s linear;pointer-events:none;
+}
+.mc-seek-thumb{
+  position:absolute;top:50%;right:calc(100% - var(--spct,0%));
+  transform:translate(50%,-50%);
+  width:11px;height:11px;border-radius:50%;background:#c4b5fd;
+  box-shadow:0 0 6px rgba(167,139,250,.7);opacity:0;transition:opacity .15s;pointer-events:none;
+}
+.mc-seek-bar:hover .mc-seek-thumb{opacity:1}
+/* Bars */
+.wv-bar{
+  flex:1;max-width:7px;min-width:2px;
+  background:linear-gradient(to top,rgba(88,28,220,.7),rgba(167,139,250,.9));
+  border-radius:2px 2px 1px 1px;will-change:height;
+  transition:height 0.04s linear;height:3px;opacity:.9;
+}
+/* ===== END UPDATED ===== */
 .progress-row{display:flex;align-items:center;gap:8px;margin-bottom:12px}
-.time-txt{font-size:10px;color:rgba(226,232,240,.55);min-width:32px}
+.time-txt{font-size:10px;color:rgba(226,232,240,.55);min-width:32px;font-family:monospace}
 .time-txt.right{text-align:right}
 .seekbar-wrap{flex:1;height:6px;border-radius:999px;background:rgba(148,163,184,.15);cursor:pointer;position:relative;overflow:hidden}
 .seekbar-fill{height:100%;width:0%;border-radius:999px;background:linear-gradient(90deg,#7c3aed,#a78bfa);transition:width .25s linear}
@@ -536,9 +982,6 @@ ha-card{border-radius:20px;overflow:hidden;font-family:'Segoe UI',system-ui,sans
 .ctrl-btn.play{width:52px;height:52px;font-size:20px;background:linear-gradient(135deg,#7c3aed,#5b21b6);border:1px solid rgba(139,92,246,.5);box-shadow:0 4px 20px rgba(109,40,217,.4);color:#fff}
 .ctrl-btn.stop{background:rgba(239,68,68,.15);border-color:rgba(239,68,68,.25);color:rgba(239,68,68,.9)}
 .ctrl-btn.active-btn{background:rgba(34,197,94,.15);border-color:rgba(34,197,94,.3);color:rgba(34,197,94,.9)}
-.toggle-pill-row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
-.toggle-pill{flex:1;min-width:80px;padding:7px 10px;border-radius:10px;border:1px solid rgba(148,163,184,.15);background:rgba(2,6,23,.3);color:rgba(226,232,240,.7);font-size:10px;font-weight:700;cursor:pointer;text-align:center;transition:all .15s}
-.toggle-pill.on{background:rgba(109,40,217,.25);border-color:rgba(139,92,246,.35);color:#c4b5fd}
 .vol-row{display:flex;align-items:center;gap:8px}
 .vol-icon{font-size:12px;color:rgba(226,232,240,.6)}
 .vol-label{font-size:10px;color:rgba(226,232,240,.5);min-width:40px;text-align:right}
@@ -582,19 +1025,27 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;heigh
 .sub-tabs{display:flex;gap:4px;margin-bottom:8px}
 .sub-tab{padding:5px 10px;border-radius:8px;cursor:pointer;font-size:10px;font-weight:700;border:1px solid rgba(148,163,184,.12);background:transparent;color:rgba(226,232,240,.5);transition:all .15s}
 .sub-tab.active{background:rgba(109,40,217,.3);border-color:rgba(139,92,246,.3);color:#c4b5fd}
-.eq-container{display:flex;gap:4px;justify-content:center;align-items:flex-end;padding:6px 0}
-.eq-band{display:flex;flex-direction:column;align-items:center;gap:3px}
-.eq-band input[type=range]{writing-mode:vertical-lr;direction:rtl;-webkit-appearance:slider-vertical;width:18px;height:70px;flex:none;padding:0}
+/* ===== UPDATED v6.1.4: EQ bands full-width with value labels ===== */
+.eq-container{display:flex;justify-content:space-evenly;align-items:flex-end;padding:8px 0;width:100%}
+.eq-band{display:flex;flex-direction:column;align-items:center;gap:4px;flex:1}
+.eq-band-val{font-size:10px;font-weight:700;color:#a78bfa;text-align:center;min-height:16px;line-height:16px}
+.eq-band input[type=range]{writing-mode:vertical-lr;direction:rtl;-webkit-appearance:slider-vertical;width:22px;height:95px;flex:none;padding:0}
 .eq-band label{font-size:9px;color:rgba(226,232,240,.4)}
+/* ===== END UPDATED ===== */
 .preset-row{display:flex;flex-wrap:wrap;gap:4px;justify-content:center;margin:6px 0}
 .preset-btn{padding:4px 10px;border-radius:8px;cursor:pointer;font-size:10px;font-weight:700;border:1px solid rgba(148,163,184,.12);background:rgba(2,6,23,.3);color:rgba(226,232,240,.5);transition:all .15s}
 .preset-btn:hover{background:rgba(109,40,217,.2);border-color:rgba(139,92,246,.2);color:#c4b5fd}
+.collapsible-header{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border-radius:12px;border:1px solid rgba(148,163,184,.1);background:rgba(2,6,23,.4);cursor:pointer;margin-bottom:6px;transition:all .15s;user-select:none}
+.collapsible-header:hover{background:rgba(109,40,217,.15);border-color:rgba(139,92,246,.2)}
+.collapsible-title{font-size:11px;font-weight:800;color:#e2e8f0;display:flex;align-items:center;gap:6px}
+.collapsible-arrow{font-size:10px;color:rgba(226,232,240,.5);transition:transform .2s}
+.collapsible-arrow.open{transform:rotate(180deg)}
+.collapsible-body{overflow:hidden;transition:max-height .3s ease}
+.collapsible-body.closed{display:none}
 .alarm-item{padding:10px 12px;border-radius:12px;border:1px solid rgba(148,163,184,.1);background:rgba(2,6,23,.3);margin-bottom:6px}
 .alarm-time{font-size:22px;font-weight:900;color:#e2e8f0}
 .alarm-meta{font-size:10px;color:rgba(226,232,240,.5);margin-top:3px}
 .alarm-actions{display:flex;gap:4px;flex-shrink:0}
-.alarm-banner{position:absolute;top:0;left:0;right:0;z-index:100;background:rgba(239,68,68,.95);padding:10px;text-align:center;border-radius:20px 20px 0 0;transition:transform .3s;transform:translateY(-100%)}
-.alarm-banner.show{transform:translateY(0)}
 .chat-wrap{border-radius:16px;overflow:hidden;border:1px solid rgba(148,163,184,.12);background:rgba(2,6,23,.4);position:relative}
 .chat-bg{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:.22;display:none;pointer-events:none}
 .msgs{position:relative;height:240px;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:7px;scroll-behavior:smooth}
@@ -647,25 +1098,21 @@ select.form-inp{cursor:pointer}
 .pl-name{font-size:11px;font-weight:700;color:#e2e8f0;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .pl-count{font-size:9px;color:rgba(226,232,240,.45);margin-left:8px}
 .pl-btns{display:flex;gap:3px;margin-left:8px}
-.scan-device{padding:6px 8px;border-radius:8px;background:rgba(109,40,217,.1);margin-bottom:3px;font-size:10px;color:#e2e8f0;cursor:pointer}
-.scan-device:hover{background:rgba(109,40,217,.25)}
 .al-days{display:flex;flex-wrap:wrap;gap:5px;margin-top:6px}
 .al-days label{display:flex;align-items:center;gap:3px;font-size:10px;color:rgba(226,232,240,.6);cursor:pointer}
 .al-days input{width:14px;height:14px;accent-color:#7c3aed}
-.prem-banner{background:linear-gradient(135deg,rgba(234,179,8,.08),rgba(251,146,60,.08));border:1px solid rgba(234,179,8,.15);border-radius:12px;padding:10px;margin-bottom:8px;text-align:center}
-.prem-banner h4{font-size:12px;font-weight:800;color:#fbbf24;margin-bottom:4px}
-.prem-banner p{font-size:10px;color:rgba(226,232,240,.5);line-height:1.5}
 .toast{position:fixed;z-index:9999;left:50%;transform:translateX(-50%);bottom:16px;background:rgba(2,6,23,.9);border:1px solid rgba(148,163,184,.2);color:#e2e8f0;padding:9px 14px;border-radius:12px;font-size:11px;opacity:0;pointer-events:none;transition:opacity .18s,transform .18s;white-space:nowrap}
 .toast.on{opacity:1;transform:translateX(-50%) translateY(-6px)}
 .toast.success{border-color:rgba(34,197,94,.3);color:#86efac}
 .toast.error{border-color:rgba(239,68,68,.3);color:#fca5a5}
 .fx{display:flex}.aic{align-items:center}.jcb{justify-content:space-between}.g4{gap:4px}.g6{gap:6px}.g8{gap:8px}.mt6{margin-top:6px}.mt8{margin-top:8px}.mb6{margin-bottom:6px}.mb8{margin-bottom:8px}.f1{flex:1;min-width:0}.o5{opacity:.5}
 .hidden{display:none!important}
-@media(max-width:480px){.wrap{padding:10px 10px 8px}.title-text{font-size:14px}.version{font-size:9px}.badge-icon{width:28px;height:28px;font-size:13px}.tabs{padding:4px;gap:4px}.tab{font-size:10px;padding:7px 4px}.body{height:460px}.mc-thumb-wrap{width:70px;height:70px}.mc-title{font-size:13px}.waveform{height:55px}.ctrl-btn{width:34px;height:34px;font-size:13px}.ctrl-btn.play{width:46px;height:46px;font-size:18px}.msgs{height:200px}.bubble{font-size:11px}.toggle-left .tog-name{font-size:11px}.sw{width:38px;height:22px}.sw::after{width:14px;height:14px;top:3px;left:3px}.sw.on::after{left:19px}.rbtn{font-size:10px;padding:4px 8px}}
+@media(max-width:480px){.wrap{padding:10px 10px 8px}.title-text{font-size:14px}.version{font-size:9px}.badge-icon{width:28px;height:28px;font-size:13px}.tabs{padding:4px;gap:4px}.tab{font-size:10px;padding:7px 4px}.body{height:460px}.mc-thumb-wrap{width:70px;height:70px}.mc-vis{height:130px}.mc-title{font-size:13px}.ctrl-btn{width:34px;height:34px;font-size:13px}.ctrl-btn.play{width:46px;height:46px;font-size:18px}.msgs{height:200px}.bubble{font-size:11px}.toggle-left .tog-name{font-size:11px}.sw{width:38px;height:22px}.sw::after{width:14px;height:14px;top:3px;left:3px}.sw.on::after{left:19px}.rbtn{font-size:10px;padding:4px 8px}.eq-band input[type=range]{height:70px}.eq-band-val{font-size:9px}}
 </style>
 `;
     this._setConnDot(this._wsConnected);
     if (this._rooms) this._renderRoomPills();
+    if (this._offline) this._setOffline(true, this._retryIn * 1000);
     this._renderMedia(); this._renderVolume();
     this._renderControlToggles(); this._renderLight();
     this._renderWakeWord(); this._renderCustomAi(); this._renderVoice();
@@ -676,7 +1123,9 @@ select.form-inp{cursor:pointer}
   }
 
   _panelMedia(tab) {
-    let wvBars = ''; for (let i = 0; i < 40; i++) wvBars += `<div class="wv-bar" style="--i:${i}"></div>`;
+    // 40 waveform bars for full-width coverage
+    // 60 bars — web-style full width, bell curve envelope
+    let wvBars = ''; for (let i = 0; i < 60; i++) wvBars += `<div class="wv-bar" style="--i:${i}"></div>`;
     return `
 <div class="panel ${tab==="media"?"active":""}" id="p-media">
   <div class="media-card">
@@ -691,13 +1140,30 @@ select.form-inp{cursor:pointer}
         <button class="mc-icon-btn" id="btnShuffle" title="Shuffle">⇄</button>
       </div>
     </div>
-    <div class="mc-body">
-      <div class="mc-thumb-wrap">
-        <img id="mediaThumb" class="mc-thumb" style="display:none" />
-        <div id="thumbFallback" class="mc-thumb-fb">🎵</div>
+    <div class="mc-vis" id="mcVis">
+      <!-- Background blur từ thumbnail -->
+      <div class="mc-bg" id="mcBg"></div>
+      <!-- Hàng trên: thumb tròn -->
+      <div class="mc-top">
+        <div class="mc-thumb-wrap">
+          <img id="mediaThumb" class="mc-thumb" style="display:none" />
+          <div id="thumbFallback" class="mc-thumb-fb">🎵</div>
+        </div>
       </div>
-      <div class="mc-waveform-area">
+      <!-- Waveform full width -->
+      <div class="waveform-wrap">
         <div class="waveform off" id="waveform">${wvBars}</div>
+      </div>
+      <!-- Seekbar trong mc-vis -->
+      <div class="mc-seek-wrap">
+        <div class="mc-seek-row">
+          <span class="time-txt" id="posText">0:00</span>
+          <div class="mc-seek-bar" id="seekWrap">
+            <div class="mc-seek-fill" id="seekBar"></div>
+            <div class="mc-seek-thumb" id="seekThumb"></div>
+          </div>
+          <span class="time-txt right" id="durText">0:00</span>
+        </div>
       </div>
     </div>
     <div class="media-controls">
@@ -705,11 +1171,6 @@ select.form-inp{cursor:pointer}
       <button class="ctrl-btn play" id="btnPlayPause" title="Play/Pause">▶</button>
       <button class="ctrl-btn stop" id="btnStop" title="Stop">■</button>
       <button class="ctrl-btn" id="btnNext" title="Next">⏭</button>
-    </div>
-    <div class="progress-row">
-      <span class="time-txt" id="posText">0:00</span>
-      <div class="seekbar-wrap" id="seekWrap"><div class="seekbar-fill" id="seekBar"></div></div>
-      <span class="time-txt right" id="durText">0:00</span>
     </div>
   </div>
   <div class="search-tabs">
@@ -739,15 +1200,16 @@ select.form-inp{cursor:pointer}
   _panelControl(tab) {
     let voiceOpts = ''; for (let i = 1; i <= 30; i++) voiceOpts += `<option value="${i}">${i}. ${VOICES[i]}</option>`;
     const at = this._activeAudioTab, lt = this._activeLightTab;
+    const audioOpen = this._audioOpen, lightOpen = this._lightOpen;
     return `
 <div class="panel ${tab==="control"?"active":""}" id="p-control">
   <div class="ctrl-section">
     <div class="section-label">📡 CONTROL</div>
-    <div class="toggle-item"><div class="toggle-left"><div class="tog-name">🎙 Wake Word(Ô Kề Na Bu)</div></div><div class="sw unknown" id="swWake"></div></div>
+    <div class="toggle-item"><div class="toggle-left"><div class="tog-name">🎙 Wake Word (Ô Kề Na Bu)</div></div><div class="sw unknown" id="swWake"></div></div>
     <div id="wakeSensRow" style="display:none">
-      <div class="slider-row"><div class="slider-row-top"><span class="s-name">Độ nhạy(nên để từ 0.95~0.99)</span><span class="s-val" id="wakeVal">0.90</span></div><input type="range" id="wakeSlider" min="0" max="1" step="0.01" value="0.90" style="width:100%" /><div class="fx jcb" style="font-size:9px;color:rgba(226,232,240,.35)"><span>Dễ kích hoạt</span><span>Khó kích hoạt</span></div></div>
+      <div class="slider-row"><div class="slider-row-top"><span class="s-name">Độ nhạy (nên để 0.95~0.99)</span><span class="s-val" id="wakeVal">0.90</span></div><input type="range" id="wakeSlider" min="0" max="1" step="0.01" value="0.90" style="width:100%" /><div class="fx jcb" style="font-size:9px;color:rgba(226,232,240,.35)"><span>Dễ kích hoạt</span><span>Khó kích hoạt</span></div></div>
     </div>
-    <div class="toggle-item" id="customAiRow" style="display:none"><div class="toggle-left"><div class="tog-name">🧠 Chống Điếc AI(Tắt nếu dùng server Việt Ai Box)</div><div class="tog-desc">Khi bật sẽ nhận diện giọng nói chuẩn 99% và Đổi giọng của AI, chú ý cố gắng nói ngắn gọn tập trung vào ý chính để hoạt động tốt nhất.</div></div><div class="sw unknown" id="swCustomAi"></div></div>
+    <div class="toggle-item" id="customAiRow" style="display:none"><div class="toggle-left"><div class="tog-name">🧠 Chống Điếc AI</div><div class="tog-desc">Khi bật sẽ nhận diện giọng nói chuẩn 99% và đổi giọng AI</div></div><div class="sw unknown" id="swCustomAi"></div></div>
   </div>
   <div class="ctrl-section" id="voiceRow" style="display:none">
     <div class="section-label">🎤 Chọn Giọng Nói AI</div>
@@ -761,69 +1223,64 @@ select.form-inp{cursor:pointer}
     <div class="toggle-item"><div class="toggle-left"><div class="tog-name">📡 DLNA</div></div><div class="sw unknown" id="swDlna"></div></div>
     <div class="toggle-item"><div class="toggle-left"><div class="tog-name">🍎 AirPlay</div></div><div class="sw unknown" id="swAirplay"></div></div>
     <div class="toggle-item"><div class="toggle-left"><div class="tog-name">🔵 Bluetooth</div></div><div class="sw unknown" id="swBt"></div></div>
-    <div class="toggle-item"><div class="toggle-left"><div class="tog-name">💡 Đèn LED Chờ(Tắt để nháy theo nhạc)</div></div><div class="sw unknown" id="swLed"></div></div>
+    <div class="toggle-item"><div class="toggle-left"><div class="tog-name">💡 Đèn LED Chờ (Tắt để nháy theo nhạc)</div></div><div class="sw unknown" id="swLed"></div></div>
   </div>
+
   <div class="ctrl-section">
-    <div class="toggle-item"><div class="toggle-left"><div class="tog-name">🔊 Stereo Mode - Loa Mẹ</div></div><div class="sw" id="swStereo"></div></div>
-    <div id="stereoMasterOpts" class="hidden">
-      <div class="fx g4 mb6 aic">
-        <span style="font-size:10px;color:rgba(226,232,240,.5);flex-shrink:0">📢 Kênh:</span>
-        <select class="form-inp" id="masterChannel" style="width:90px;flex-shrink:0">
-          <option value="left">Trái (L)</option>
-          <option value="right">Phải (R)</option>
-        </select>
-        <input class="form-inp" id="slaveIp" placeholder="IP loa con" style="flex:1" />
-        <button class="form-btn sm" id="btnStereoScan">🔍 Scan</button>
+    <div class="collapsible-header" id="audioCollHeader">
+      <span class="collapsible-title">🎛 Audio Engine</span>
+      <span class="collapsible-arrow ${audioOpen ? 'open' : ''}" id="audioArrow">▼</span>
+    </div>
+    <div class="collapsible-body ${audioOpen ? '' : 'closed'}" id="audioCollBody">
+      <div class="sub-tabs" style="margin-top:6px">
+        <button class="sub-tab ${at==='eq'?'active':''}" data-atab="eq">Equalizer</button>
+        <button class="sub-tab ${at==='sur'?'active':''}" data-atab="sur">Surround</button>
       </div>
-      <div id="stereoScanResults"></div>
+      <div id="audioEq" class="${at!=='eq'?'hidden':''}">
+        <div class="toggle-item mb6"><div class="toggle-left"><div class="tog-name">🎚 Equalizer Enable</div></div><div class="sw" id="swEq"></div></div>
+        <div class="eq-container" id="eqBands"></div>
+        <div class="preset-row">${['flat','bass','vocal','rock','jazz'].map(p=>`<button class="preset-btn" data-pr="${p}">${p==='bass'?'Bass Boost':p.charAt(0).toUpperCase()+p.slice(1)}</button>`).join('')}</div>
+        <div class="toggle-item mt6"><div class="toggle-left"><div class="tog-name">🎵 Tăng cường bass</div></div><div class="sw" id="swBass"></div></div>
+        <div class="slider-row"><div class="slider-row-top"><span class="s-name">Strength</span><span class="s-val" id="bassVal">0%</span></div><input type="range" id="bassSlider" min="0" max="1000" step="10" value="0" style="width:100%" /><div class="fx jcb" style="font-size:9px;color:rgba(226,232,240,.35)"><span>0%</span><span>50%</span><span>100%</span></div></div>
+        <div class="toggle-item mt6"><div class="toggle-left"><div class="tog-name">🔊 Độ lớn âm thanh</div></div><div class="sw" id="swLoud"></div></div>
+        <div class="slider-row"><div class="slider-row-top"><span class="s-name">Gain</span><span class="s-val" id="loudVal">0.0 dB</span></div><input type="range" id="loudSlider" min="-3000" max="3000" value="0" style="width:100%" /><div class="fx jcb" style="font-size:9px;color:rgba(226,232,240,.35)"><span>-30 dB</span><span>0 dB</span><span>+30 dB</span></div></div>
+        <div class="section-label mt8">🔊 Dải Trung-Cao</div>
+        <div class="slider-row"><div class="slider-row-top"><span class="s-name">Âm trầm trung</span><span class="s-val" id="bvVal">+0 dB</span></div><input type="range" id="bvSlider" min="211" max="251" value="231" style="width:100%" /><div class="fx jcb" style="font-size:9px;color:rgba(226,232,240,.35)"><span>-20 dB</span><span>0 dB</span><span>+20 dB</span></div></div>
+        <div class="slider-row"><div class="slider-row-top"><span class="s-name">Âm nốt cao</span><span class="s-val" id="hvVal">+0 dB</span></div><input type="range" id="hvSlider" min="211" max="251" value="231" style="width:100%" /><div class="fx jcb" style="font-size:9px;color:rgba(226,232,240,.35)"><span>-20 dB</span><span>0 dB</span><span>+20 dB</span></div></div>
+      </div>
+      <div id="audioSur" class="${at!=='sur'?'hidden':''}">
+        <div class="slider-row"><div class="slider-row-top"><span class="s-name">↔ Width</span><span class="s-val" id="surWVal">40</span></div><input type="range" id="surW" min="0" max="100" value="40" style="width:100%" /></div>
+        <div class="slider-row"><div class="slider-row-top"><span class="s-name">🎯 Presence</span><span class="s-val" id="surPVal">30</span></div><input type="range" id="surP" min="0" max="100" value="30" style="width:100%" /></div>
+        <div class="slider-row"><div class="slider-row-top"><span class="s-name">🌌 Space</span><span class="s-val" id="surSVal">10</span></div><input type="range" id="surS" min="0" max="100" value="10" style="width:100%" /></div>
+        <div class="preset-row"><button class="preset-btn" data-sur="cinema">🎬 Cinema</button><button class="preset-btn" data-sur="wide">🌌 Wide Space</button><button class="preset-btn" data-sur="reset">↺ Reset</button></div>
+      </div>
     </div>
-    <div class="toggle-item"><div class="toggle-left"><div class="tog-name">🎧 Stereo Mode - Loa Con</div><div class="tog-desc">Bật để nhận audio từ loa mẹ,chỉ bật 1 trong 2</div></div><div class="sw" id="swStereoRx"></div></div>
-    <div class="fx g4 aic mt6"><span style="font-size:10px;color:rgba(226,232,240,.5)">⏱ Sync Delay (ms):</span><input class="form-inp" id="syncDelay" type="number" min="0" max="2000" step="50" value="0" style="width:80px" /><button class="form-btn sm" id="btnSyncDelay">✓</button></div>
-    <div style="font-size:9px;color:rgba(226,232,240,.3);margin-top:4px">0~2000 (mặc định: 0) - Điều chỉnh khi lệch tốc độ với loa mẹ</div>
   </div>
+
   <div class="ctrl-section">
-    <div class="section-label">🎛 Audio Engine</div>
-    <div class="sub-tabs">
-      <button class="sub-tab ${at==='eq'?'active':''}" data-atab="eq">Equalizer</button>
-      <button class="sub-tab ${at==='sur'?'active':''}" data-atab="sur">Surround</button>
+    <div class="collapsible-header" id="lightCollHeader">
+      <span class="collapsible-title">💡 Lighting Control</span>
+      <span class="collapsible-arrow ${lightOpen ? 'open' : ''}" id="lightArrow">▼</span>
     </div>
-    <div id="audioEq" class="${at!=='eq'?'hidden':''}">
-      <div class="toggle-item mb6"><div class="toggle-left"><div class="tog-name">🎚 Equalizer Enable</div></div><div class="sw" id="swEq"></div></div>
-      <div class="eq-container" id="eqBands"></div>
-      <div class="preset-row">${['flat','bass','vocal','rock','jazz'].map(p=>`<button class="preset-btn" data-pr="${p}">${p==='bass'?'Bass Boost':p.charAt(0).toUpperCase()+p.slice(1)}</button>`).join('')}</div>
-      <div class="toggle-item mt6"><div class="toggle-left"><div class="tog-name">🎵 Tăng cường bass</div></div><div class="sw" id="swBass"></div></div>
-      <div class="slider-row"><div class="slider-row-top"><span class="s-name">Strength</span><span class="s-val" id="bassVal">0%</span></div><input type="range" id="bassSlider" min="0" max="1000" step="10" value="0" style="width:100%" /><div class="fx jcb" style="font-size:9px;color:rgba(226,232,240,.35)"><span>0%</span><span>50%</span><span>100%</span></div></div>
-      <div class="toggle-item mt6"><div class="toggle-left"><div class="tog-name">🔊 Độ lớn âm thanh</div></div><div class="sw" id="swLoud"></div></div>
-      <div class="slider-row"><div class="slider-row-top"><span class="s-name">Gain</span><span class="s-val" id="loudVal">0.0 dB</span></div><input type="range" id="loudSlider" min="-3000" max="3000" value="0" style="width:100%" /><div class="fx jcb" style="font-size:9px;color:rgba(226,232,240,.35)"><span>-30 dB</span><span>0 dB</span><span>+30 dB</span></div></div>
-      <div class="section-label mt8">🔊 Dải Trung-Cao</div>
-      <div class="slider-row"><div class="slider-row-top"><span class="s-name">Âm trầm trung</span><span class="s-val" id="bvVal">+0 dB</span></div><input type="range" id="bvSlider" min="211" max="251" value="231" style="width:100%" /><div class="fx jcb" style="font-size:9px;color:rgba(226,232,240,.35)"><span>-20 dB</span><span>0 dB</span><span>+20 dB</span></div></div>
-      <div class="slider-row"><div class="slider-row-top"><span class="s-name">Âm nốt cao</span><span class="s-val" id="hvVal">+0 dB</span></div><input type="range" id="hvSlider" min="211" max="251" value="231" style="width:100%" /><div class="fx jcb" style="font-size:9px;color:rgba(226,232,240,.35)"><span>-20 dB</span><span>0 dB</span><span>+20 dB</span></div></div>
-    </div>
-    <div id="audioSur" class="${at!=='sur'?'hidden':''}">
-      <div class="slider-row"><div class="slider-row-top"><span class="s-name">↔ Width</span><span class="s-val" id="surWVal">40</span></div><input type="range" id="surW" min="0" max="100" value="40" style="width:100%" /></div>
-      <div class="slider-row"><div class="slider-row-top"><span class="s-name">🎯 Presence</span><span class="s-val" id="surPVal">30</span></div><input type="range" id="surP" min="0" max="100" value="30" style="width:100%" /></div>
-      <div class="slider-row"><div class="slider-row-top"><span class="s-name">🌌 Space</span><span class="s-val" id="surSVal">10</span></div><input type="range" id="surS" min="0" max="100" value="10" style="width:100%" /></div>
-      <div class="preset-row"><button class="preset-btn" data-sur="cinema">🎬 Cinema</button><button class="preset-btn" data-sur="wide">🌌 Wide Space</button><button class="preset-btn" data-sur="reset">↺ Reset</button></div>
+    <div class="collapsible-body ${lightOpen ? '' : 'closed'}" id="lightCollBody">
+      <div class="sub-tabs" style="margin-top:6px">
+        <button class="sub-tab ${lt==='main'?'active':''}" data-ltab="main">Đèn Chính (RGB)</button>
+        <button class="sub-tab ${lt==='edge'?'active':''}" data-ltab="edge">Đèn Viền (Edge)</button>
+      </div>
+      <div id="lightMain" class="${lt!=='main'?'hidden':''}">
+        <div class="toggle-item"><div class="toggle-left"><div class="tog-name">Trạng thái</div></div><div class="sw unknown" id="swLight"></div></div>
+        <div class="slider-row"><div class="slider-row-top"><span class="s-name">⚙ Cường độ sáng</span><span class="s-val" id="brightVal">200</span></div><input type="range" id="brightSlider" min="1" max="200" value="200" style="width:100%" /></div>
+        <div class="slider-row"><div class="slider-row-top"><span class="s-name">⚡ Tốc độ</span><span class="s-val" id="speedVal">1</span></div><input type="range" id="speedSlider" min="1" max="100" value="1" style="width:100%" /></div>
+        <div class="section-label mt6" style="font-size:11px">Chế độ tích hợp (Firmware)</div>
+        <div class="preset-row">${[['0','Mặc Định'],['1','Xoay vòng'],['2','Nháy 1'],['3','Đơn sắc'],['4','Nháy 2'],['7','Hơi thở']].map(([v,n])=>`<button class="preset-btn" data-lmode="${v}">${n}</button>`).join('')}</div>
+      </div>
+      <div id="lightEdge" class="${lt!=='edge'?'hidden':''}">
+        <div class="toggle-item"><div class="toggle-left"><div class="tog-name">Trạng thái</div></div><div class="sw" id="swEdge"></div></div>
+        <div class="slider-row"><div class="slider-row-top"><span class="s-name">💡 Cường độ viền</span><span class="s-val" id="edgeVal">100%</span></div><input type="range" id="edgeSlider" min="0" max="100" value="100" style="width:100%" /></div>
+      </div>
     </div>
   </div>
-  <div class="ctrl-section">
-    <div class="section-label">💡 Lighting Control</div>
-    <div class="sub-tabs">
-      <button class="sub-tab ${lt==='main'?'active':''}" data-ltab="main">Đèn Chính (RGB)</button>
-      <button class="sub-tab ${lt==='edge'?'active':''}" data-ltab="edge">Đèn Viền (Edge)</button>
-    </div>
-    <div id="lightMain" class="${lt!=='main'?'hidden':''}">
-      <div class="toggle-item"><div class="toggle-left"><div class="tog-name">Trạng thái</div></div><div class="sw unknown" id="swLight"></div></div>
-      <div class="slider-row"><div class="slider-row-top"><span class="s-name">⚙ Cường độ sáng</span><span class="s-val" id="brightVal">200</span></div><input type="range" id="brightSlider" min="1" max="200" value="200" style="width:100%" /></div>
-      <div class="slider-row"><div class="slider-row-top"><span class="s-name">⚡ Tốc độ</span><span class="s-val" id="speedVal">1</span></div><input type="range" id="speedSlider" min="1" max="100" value="1" style="width:100%" /></div>
-      <div class="section-label mt6" style="font-size:11px">Chế độ tích hợp (Firmware)</div>
-      <div class="preset-row">${[['0','Mặc Định'],['1','Xoay vòng'],['2','Nháy 1'],['3','Đơn sắc'],['4','Nháy 2'],['7','Hơi thở']].map(([v,n])=>`<button class="preset-btn" data-lmode="${v}">${n}</button>`).join('')}</div>
-    </div>
-    <div id="lightEdge" class="${lt!=='edge'?'hidden':''}">
-      <div class="toggle-item"><div class="toggle-left"><div class="tog-name">Trạng thái</div></div><div class="sw" id="swEdge"></div></div>
-      <div class="slider-row"><div class="slider-row-top"><span class="s-name">💡 Cường độ viền</span><span class="s-val" id="edgeVal">100%</span></div><input type="range" id="edgeSlider" min="0" max="100" value="100" style="width:100%" /></div>
-    </div>
-  </div>
+
   <div class="ctrl-section">
     <div class="fx jcb aic mb6"><div class="section-label" style="margin:0">⏰ Báo thức</div>
     <div class="fx g4"><button class="form-btn sm" id="btnAlarmAdd">+ Thêm</button><button class="form-btn sm" id="btnAlarmRefresh">🔄</button></div></div>
@@ -878,19 +1335,25 @@ select.form-inp{cursor:pointer}
   <div id="wifiScanArea" class="mt6"></div>
   <div id="wifiSavedArea" class="mt6"></div></div>
   <div class="sys-info-item mt8"><div class="sys-label">Kết nối</div>
-  <div class="sys-value" style="font-size:10px">${this._esc(this._isHttps()?"HTTPS – cần tunnel WSS":"HTTP – WS LAN OK")} | LAN: ${this._esc(this._lanWsUrl())}${this._tunnelWsUrl()?` | Tunnel: ${this._esc(this._tunnelWsUrl())}`:""}</div></div>
+  <div class="sys-value" style="font-size:10px">${this._esc(this._isHttps()?"HTTPS – tunnel WSS":"HTTP – WS LAN")} | ${this._isHttps() ? (this._tunnelWsUrl() ? `Tunnel: ${this._esc(this._tunnelWsUrl())}` : "Chưa có tunnel") : `LAN: ${this._esc(this._lanWsUrl())}`}</div></div>
 </div>`;
   }
 
   _bind() {
-    // ── Room pills ──
     if (this._rooms) {
       this.querySelectorAll(".room-pill").forEach(pill => {
         pill.onclick = () => this._switchRoom(parseInt(pill.dataset.ridx));
       });
     }
 
-    this.querySelectorAll(".tab").forEach(b => { b.onclick = () => { this._activeTab = b.dataset.tab; this._render(); this._bind(); if (b.dataset.tab === "control") this._send({ action: "alarm_list" }); }; });
+    this.querySelectorAll(".tab").forEach(b => { b.onclick = () => {
+      const newTab = b.dataset.tab;
+      if (newTab === this._activeTab) return; // không re-render nếu cùng tab
+      this._activeTab = newTab;
+      this._render(); this._bind();
+      // Lazy load — chỉ load data + start services cho tab vừa kích
+      this._loadTab(newTab);
+    }; });
 
     this._on("#seekWrap", null, el => { el.onclick = e => { const m = this._state.media; if (!m.duration) return; const r = el.getBoundingClientRect(); const pos = Math.floor(m.duration * Math.max(0, Math.min(1, (e.clientX - r.left) / r.width))); m.position = pos; this._send({ action: "seek", position: pos }); this._updateProgressOnly(); }; });
     this._on("#btnPlayPause", () => {
@@ -948,13 +1411,33 @@ select.form-inp{cursor:pointer}
     this._bindSwitch("#swBt", () => {
       this._ctrlGuard = Date.now();
       this._state.bluetoothOn = !this._state.bluetoothOn;
-      if (this._state.bluetoothOn) {
-        this._sendSpk({ type: "send_message", what: 64, arg1: 1, arg2: -1, type_id: "Open Bluetooth" });
-      } else {
-        this._sendSpk({ type: "send_message", what: 64, arg1: 2, arg2: -1, type_id: "Close Bluetooth" });
-      }
+      if (this._state.bluetoothOn) { this._sendSpk({ type: "send_message", what: 64, arg1: 1, arg2: -1, type_id: "Open Bluetooth" }); }
+      else { this._sendSpk({ type: "send_message", what: 64, arg1: 2, arg2: -1, type_id: "Close Bluetooth" }); }
       this._renderControlToggles();
     });
+
+    const audioHdr = this.querySelector("#audioCollHeader");
+    if (audioHdr) {
+      audioHdr.onclick = () => {
+        this._audioOpen = !this._audioOpen;
+        const body = this.querySelector("#audioCollBody");
+        const arrow = this.querySelector("#audioArrow");
+        if (body) body.classList.toggle("closed", !this._audioOpen);
+        if (arrow) arrow.classList.toggle("open", this._audioOpen);
+        if (this._audioOpen) this._buildEqBands();
+      };
+    }
+
+    const lightHdr = this.querySelector("#lightCollHeader");
+    if (lightHdr) {
+      lightHdr.onclick = () => {
+        this._lightOpen = !this._lightOpen;
+        const body = this.querySelector("#lightCollBody");
+        const arrow = this.querySelector("#lightArrow");
+        if (body) body.classList.toggle("closed", !this._lightOpen);
+        if (arrow) arrow.classList.toggle("open", this._lightOpen);
+      };
+    }
 
     this.querySelectorAll("[data-ltab]").forEach(b => { b.onclick = () => {
       this._activeLightTab = b.dataset.ltab;
@@ -1040,65 +1523,22 @@ select.form-inp{cursor:pointer}
     this._on("#btnVoicePv", () => { const vid = parseInt(this.querySelector("#voiceSel")?.value || 1); const a = new Audio(VBASE + (VFILES[vid] || 'ngocanh') + '.mp3'); a.play().catch(() => this._toast("Không phát được", "error")); });
     const l2d = this.querySelector("#live2dSel"); if (l2d) l2d.onchange = () => this._send({ action: "live2d_set_model", model: l2d.value });
 
-    // ── Stereo Master (FIXED: removed orphaned duplicate) ──
-    this._bindSwitch("#swStereo", () => {
-      const en = !this._state.stereo.enabled;
-      this._state.stereo.enabled = en;
-      this._stereoGuard = Date.now();
-      // Mutex: bật master thì tắt receiver
-      if (en && this._state.stereo.receiverEnabled) {
-        this._state.stereo.receiverEnabled = false;
-        this._send({ action: "stereo_enable_receiver", enabled: false });
-        this._updateSwitch("#swStereoRx", false);
-      }
-      this._send({ action: "stereo_enable", enabled: en });
-      const opts = this.querySelector("#stereoMasterOpts");
-      if (opts) opts.classList.toggle("hidden", !en);
-      this._updateSwitch("#swStereo", en);
-    });
-    this._on("#btnStereoScan", () => this._send({ action: "stereo_scan" }));
-    const sip = this.querySelector("#slaveIp"); if (sip) sip.onchange = () => this._send({ action: "stereo_set_slave_ip", ip: sip.value.trim() });
-    const chSel2 = this.querySelector("#masterChannel");
-    if (chSel2) {
-      chSel2.value = this._state.stereo.channel || "left";
-      chSel2.onchange = () => {
-        this._state.stereo.channel = chSel2.value;
-        this._send({ action: "stereo_set_channel", channel: chSel2.value });
-      };
-    }
-    // ── Stereo Receiver (FIXED: removed orphaned duplicate) ──
-    this._bindSwitch("#swStereoRx", () => {
-      const en = !this._state.stereo.receiverEnabled;
-      this._state.stereo.receiverEnabled = en;
-      this._stereoGuard = Date.now();
-      // Mutex: bật receiver thì tắt master
-      if (en && this._state.stereo.enabled) {
-        this._state.stereo.enabled = false;
-        this._send({ action: "stereo_enable", enabled: false });
-        const opts = this.querySelector("#stereoMasterOpts");
-        if (opts) opts.classList.add("hidden");
-        this._updateSwitch("#swStereo", false);
-      }
-      this._send({ action: "stereo_enable_receiver", enabled: en });
-      this._updateSwitch("#swStereoRx", en);
-    });
-    this._on("#btnSyncDelay", () => { const v = parseInt(this.querySelector("#syncDelay")?.value || 0); this._send({ action: "stereo_set_sync_delay", sync_delay_ms: v }); });
     this._on("#btnAlarmAdd", () => this._showAlarmModal());
     this._on("#btnAlarmRefresh", () => this._send({ action: "alarm_list" }));
 
-    // ── Chat ──
+    // Render ngay với state hiện có (không chờ server response)
+    this._renderAlarms();
+
     this._on("#chatSend", () => this._sendChat());
     const ci = this.querySelector("#chatInp"); if (ci) ci.onkeypress = e => { if (e.key === "Enter") this._sendChat(); };
     this._on("#btnSession", () => { this._send({ action: "chat_wake_up" }); });
     this._on("#btnTestMic", () => this._send({ action: "chat_test_mic" }));
-
     this._on("#btnChatClear", () => {
       this._state.chat = [];
       this._renderChatMsgs();
       this._toast("Đã xóa lịch sử chat", "success");
       this._send({ action: "chat_clear_history" });
     });
-
     this._on("#btnTikTok", () => { const v = !this._state.tiktokReply; this._state.tiktokReply = v; this._renderTikTok(); this._send({ action: "tiktok_reply_toggle", enabled: v }); });
 
     this._on("#btnMacGet", () => this._send({ action: "mac_get" }));
@@ -1122,11 +1562,23 @@ select.form-inp{cursor:pointer}
     const s = this.querySelector(sliderId); if (s) s.value = rawVal;
     const v = this.querySelector(valId); if (v) v.textContent = displayVal !== undefined ? displayVal : rawVal;
   }
+
+  // ===== UPDATED v6.1.4: EQ bands with value labels at top =====
   _buildEqBands() {
     const c = this.querySelector("#eqBands"); if (!c) return;
-    c.innerHTML = EQ_LABELS.map((f, i) => `<div class="eq-band"><input type="range" min="-1500" max="1500" step="100" value="${this._state.eqBands[i]}" orient="vertical" data-band="${i}" /><label>${f}</label></div>`).join('');
-    c.querySelectorAll("input").forEach(inp => { inp.oninput = () => { this._audioGuard = Date.now(); this._sendSpk({ type: "set_eq_bandlevel", band: parseInt(inp.dataset.band), level: parseInt(inp.value) }); }; });
+    c.innerHTML = EQ_LABELS.map((f, i) => {
+      const v = this._state.eqBands[i] || 0;
+      const dv = v > 0 ? `+${v}` : `${v}`;
+      return `<div class="eq-band"><div class="eq-band-val" id="eqVal${i}">${dv}</div><input type="range" min="-1500" max="1500" step="100" value="${v}" orient="vertical" data-band="${i}" /><label>${f}</label></div>`;
+    }).join('');
+    c.querySelectorAll("input").forEach(inp => { inp.oninput = () => {
+      this._audioGuard = Date.now();
+      const v = parseInt(inp.value);
+      const vl = this.querySelector(`#eqVal${inp.dataset.band}`); if (vl) vl.textContent = v > 0 ? `+${v}` : `${v}`;
+      this._sendSpk({ type: "set_eq_bandlevel", band: parseInt(inp.dataset.band), level: v });
+    }; });
   }
+  // ===== END UPDATED =====
 
   _doSearch() {
     const q = (this.querySelector("#searchInp")?.value || "").trim(); if (!q) return;
@@ -1186,11 +1638,9 @@ select.form-inp{cursor:pointer}
 
     if (d.type === "chat_message") {
       const isUser = d.message_type === "user";
-      const content = d.content || "";
-      this._addChatMsg(content, isUser ? "user" : "server");
+      this._addChatMsg(d.content || "", isUser ? "user" : "server");
       return;
     }
-
     if (d.type === "chat_state") {
       const st = d.state || "";
       this._state.chatSessionActive = ["connecting","listening","speaking","thinking"].includes(st);
@@ -1200,25 +1650,15 @@ select.form-inp{cursor:pointer}
       this._renderSessionBtn();
       return;
     }
-
     if (d.type === "chat_history" && Array.isArray(d.messages)) {
+      this._chatLoaded = true;
       if (this._state.chat.length === 0) {
-        this._state.chat = d.messages.map(m => ({
-          type: m.type || m.message_type || "server",
-          content: m.content || "",
-          ts: m.ts || Date.now()
-        }));
+        this._state.chat = d.messages.map(m => ({ type: m.type || m.message_type || "server", content: m.content || "", ts: m.ts || Date.now() }));
         this._renderChatMsgs();
       }
       return;
     }
-
-    if (d.type === "chat_history_cleared" || d.type === "chat_clear_history_result") {
-      this._state.chat = [];
-      this._renderChatMsgs();
-      return;
-    }
-
+    if (d.type === "chat_history_cleared" || d.type === "chat_clear_history_result") { this._state.chat = []; this._chatLoaded = true; this._renderChatMsgs(); return; }
     if (d.type === "chat_background" || d.type === "chat_background_result") { this._state.chatBg64 = d.image || d.base64 || ""; this._renderChatBg(); return; }
     if (d.type === "tiktok_reply_state" || d.type === "tiktok_reply_result") { this._state.tiktokReply = !!d.enabled; this._renderTikTok(); return; }
     if (d.type === "led_state" || d.type === "led_get_state_result" || d.type === "led_toggle_result") { if (d.enabled !== undefined) this._state.ledEnabled = !!d.enabled; this._renderControlToggles(); return; }
@@ -1246,43 +1686,53 @@ select.form-inp{cursor:pointer}
     if (d.type === "voice_id_state" || d.type === "voice_id_get_result") { if (d.voice_id !== undefined) this._state.voiceId = parseInt(d.voice_id); this._renderVoice(); return; }
     if (d.type === "live2d_model" || d.type === "live2d_get_model_result") { if (d.model) this._state.live2dModel = d.model; const sel = this.querySelector("#live2dSel"); if (sel && d.model) sel.value = d.model; return; }
     if (d.type === "alarm_list" || d.type === "alarm_list_result") { this._state.alarms = d.alarms || []; this._renderAlarms(); return; }
-    if (d.type === "alarm_added" || d.type === "alarm_edited" || d.type === "alarm_deleted" || d.type === "alarm_toggled") { this._send({ action: "alarm_list" }); return; }
-    if (d.type === "alarm_triggered") { const b = this.querySelector("#alBanner"); if (b) { b.classList.add("show"); b.querySelector(".al-msg").textContent = d.message || "⏰ Báo thức!"; } return; }
-
-    // ── Stereo state sync (with guard) ──
-    if (d.type === "stereo_get_state_result" || d.type === "stereo_enable_result" ||
-        d.type === "stereo_receiver_enable_result" || d.type === "stereo_receiver_disable_result" ||
-        d.type === "stereo_set_sync_delay_result") {
-      console.log("[AIBOX] Stereo state ←", JSON.stringify(d));
-      const st = this._state.stereo;
-      const stereoOk = Date.now() - this._stereoGuard > 2000;
-
-      if (stereoOk) {
-        if (d.enabled !== undefined) st.enabled = !!d.enabled;
-        if (d.receiver_enabled !== undefined) st.receiverEnabled = !!d.receiver_enabled;
+    if (d.type === "alarm_added") {
+      // Server trả về alarm object với field "id"
+      if (d.alarm) { this._state.alarms.push(d.alarm); this._renderAlarms(); }
+      else this._send({ action: "alarm_list" });
+      this._toast(`✅ Đã thêm báo thức lúc ${d.alarm ? String(d.alarm.hour).padStart(2,'0')+':'+String(d.alarm.minute).padStart(2,'0') : ''}`, "success");
+      return;
+    }
+    if (d.type === "alarm_edited") {
+      // alarm object dùng field "id"
+      if (d.alarm) {
+        const idx = this._state.alarms.findIndex(a => a.id === d.alarm.id);
+        if (idx >= 0) this._state.alarms[idx] = d.alarm; else this._state.alarms.push(d.alarm);
+        this._renderAlarms();
+      } else this._send({ action: "alarm_list" });
+      this._toast(`✏️ Đã cập nhật báo thức #${d.alarm?.id ?? ''}`, "success");
+      return;
+    }
+    if (d.type === "alarm_deleted") {
+      // Response không trả về id → dùng _pendingDeleteId đã track trước đó
+      const delId = d.id ?? d.alarm_id ?? this._pendingDeleteId;
+      this._pendingDeleteId = null;
+      if (delId !== undefined && delId !== null) {
+        this._state.alarms = this._state.alarms.filter(a => a.id !== delId);
+        this._renderAlarms();
+      } else {
+        this._send({ action: "alarm_list" });
       }
-      if (d.slave_ip !== undefined) st.slaveIp = d.slave_ip;
-      if (d.channel !== undefined) st.channel = d.channel;
-      if (d.sync_delay_ms !== undefined) st.syncDelay = d.sync_delay_ms;
-      this._updateSwitch("#swStereo", st.enabled); this._updateSwitch("#swStereoRx", st.receiverEnabled);
-      const opts = this.querySelector("#stereoMasterOpts"); if (opts) opts.classList.toggle("hidden", !st.enabled);
-      const sipEl = this.querySelector("#slaveIp"); if (sipEl) sipEl.value = st.slaveIp;
-      const sd = this.querySelector("#syncDelay"); if (sd) sd.value = st.syncDelay;
-      const chSel = this.querySelector("#masterChannel"); if (chSel) chSel.value = st.channel || "left";
+      this._toast(`🗑 Đã xóa báo thức`, "success");
       return;
     }
-    if (d.type === "stereo_scan_result") {
-      const el = this.querySelector("#stereoScanResults"); if (!el) return;
-      if (!d.devices?.length) { el.innerHTML = '<div style="font-size:10px;color:rgba(226,232,240,.4)">Không thấy loa con</div>'; return; }
-      el.innerHTML = d.devices.map(dev => `<div class="scan-device" data-sip="${dev.ip || ''}">${dev.name || dev.ip}</div>`).join("");
-      el.querySelectorAll(".scan-device").forEach(el => { el.onclick = () => { const ip = el.dataset.sip; const inp = this.querySelector("#slaveIp"); if (inp) inp.value = ip; this._send({ action: "stereo_set_slave_ip", ip }); }; });
+    if (d.type === "alarm_toggled") {
+      // alarm object dùng field "id"
+      if (d.alarm) {
+        const idx = this._state.alarms.findIndex(a => a.id === d.alarm.id);
+        if (idx >= 0) { this._state.alarms[idx].enabled = d.alarm.enabled; this._renderAlarms(); }
+        else this._send({ action: "alarm_list" });
+      } else {
+        // Không có data → reload list
+        this._send({ action: "alarm_list" });
+      }
       return;
     }
+    if (d.type === "alarm_triggered") { this._toast("⏰ " + (d.message || "Báo thức!"), "success"); return; }
     if (["mac_get","mac_get_result","mac_random","mac_random_result","mac_clear","mac_clear_result","mac_result"].includes(d.type)) {
       if (d.mac_address || d.mac) {
         this._state.macAddress = d.mac_address || d.mac;
-        const isCustom = d.is_custom ?? d.custom ?? d.is_spoofed ?? d.spoofed ?? (d.mac_type === "custom") ?? false;
-        this._state.macIsCustom = !!isCustom;
+        this._state.macIsCustom = !!(d.is_custom ?? d.custom ?? d.is_spoofed ?? d.spoofed ?? (d.mac_type === "custom") ?? false);
       }
       const mv = this.querySelector("#macVal"); if (mv) mv.textContent = this._state.macAddress || "--";
       const mt = this.querySelector("#macType"); if (mt) { mt.textContent = this._state.macIsCustom ? "🔀 Custom" : "📡 Real"; mt.style.color = this._state.macIsCustom ? "#fbbf24" : "#86efac"; }
@@ -1318,9 +1768,7 @@ select.form-inp{cursor:pointer}
     if (d.type === "system_stats" && typeof d.raw === "string") { this._parseProcStats(d.raw); this._renderSystem(); return; }
     if (d.type === "get_device_info" && d.data) {
       const dd = d.data;
-      if (Array.isArray(dd.cpuinfo) && dd.cpuinfo.length > 2) {
-        this._state.sys.cpu = Math.round(dd.cpuinfo[2] * 100 * 10) / 10;
-      }
+      if (Array.isArray(dd.cpuinfo) && dd.cpuinfo.length > 2) this._state.sys.cpu = Math.round(dd.cpuinfo[2] * 100 * 10) / 10;
       if (typeof dd.meminfo === "string") {
         const mTotal = (dd.meminfo.match(/MemTotal:\s+(\d+)/) || [])[1];
         const mFree  = (dd.meminfo.match(/MemFree:\s+(\d+)/)  || [])[1];
@@ -1331,11 +1779,7 @@ select.form-inp{cursor:pointer}
           this._state.sys.ram = Math.round(used / parseInt(mTotal) * 100);
         }
       }
-      this._renderSystem();
-      return;
-    }
-    if (d.type && !["heartbeat","pong","get_info","get_eq_config"].includes(d.type)) {
-      console.log("[AIBOX] Unhandled msg type:", d.type, JSON.stringify(d).substring(0, 300));
+      this._renderSystem(); return;
     }
   }
 
@@ -1344,7 +1788,11 @@ select.form-inp{cursor:pointer}
     const p = this.querySelector("#posText"), dur = this.querySelector("#durText"), bar = this.querySelector("#seekBar");
     if (p) p.textContent = this._fmtTime(m.position);
     if (dur) dur.textContent = this._fmtTime(m.duration);
-    if (bar) bar.style.width = (m.duration > 0 ? Math.min(100, (m.position / m.duration) * 100) : 0) + "%";
+    const pct = m.duration > 0 ? Math.min(100, (m.position / m.duration) * 100) : 0;
+    if (bar) bar.style.width = pct + "%";
+    // Update seek thumb position
+    const thumb = this.querySelector("#seekThumb");
+    if (thumb) thumb.style.setProperty("--spct", pct + "%");
   }
 
   _renderMedia() {
@@ -1361,6 +1809,17 @@ select.form-inp{cursor:pointer}
     const rp = this.querySelector("#btnRepeat"); if (rp) rp.classList.toggle("active-btn", !!m.repeat);
     const sh = this.querySelector("#btnShuffle"); if (sh) sh.classList.toggle("active-btn", !!m.autoNext);
     const wv = this.querySelector("#waveform"); if (wv) wv.classList.toggle("off", !m.isPlaying);
+    if (wv) this._waveBars = wv.querySelectorAll('.wv-bar');
+    // Cập nhật background blur từ thumbnail — giống web version
+    const mcBg = this.querySelector("#mcBg");
+    if (mcBg) {
+      if (m.thumb) {
+        mcBg.style.backgroundImage = `url('${m.thumb}')`;
+        mcBg.classList.add("show");
+      } else {
+        mcBg.classList.remove("show");
+      }
+    }
     this._updateProgressOnly();
   }
 
@@ -1409,7 +1868,6 @@ select.form-inp{cursor:pointer}
 
   _renderVoice() {
     const sel = this.querySelector("#voiceSel"); if (sel && this._state.voiceId) sel.value = this._state.voiceId;
-    const lbl = this.querySelector("#voiceLabel"); if (lbl) lbl.textContent = this._state.voiceId ? `#${this._state.voiceId} ${VOICES[this._state.voiceId] || ""}` : "--";
   }
 
   _renderOta() {
@@ -1430,7 +1888,7 @@ select.form-inp{cursor:pointer}
     const w = this._state.wifiStatus;
     if (!w) { el.innerHTML = '<div class="sys-info-item"><div class="sys-value" style="color:rgba(226,232,240,.4)">Đang tải WiFi...</div></div>'; return; }
     const ssid = w.current_ssid || w.ssid || w.SSID || w.connected_ssid || "";
-    const ip   = w.ip_address   || w.ip   || w.ipv4 || "---";
+    const ip   = w.ip_address || w.ip || w.ipv4 || "---";
     const rssi = w.rssi || w.signal || "--";
     const connected = w.is_connected ?? (ssid !== "");
     el.innerHTML = `<div class="sys-info-item">
@@ -1480,20 +1938,12 @@ select.form-inp{cursor:pointer}
     const serverText = this._state.chatBtnText || "";
     const serverEnabled = this._state.chatBtnEnabled;
     btn.classList.remove("session-active", "interrupt");
-    if (serverText) {
-      btn.textContent = serverText;
-    } else if (!active) {
-      btn.textContent = "🎤 Wake Up";
-    } else if (speaking) {
-      btn.textContent = "⚡ Interrupt";
-    } else {
-      btn.textContent = "🟡 End Session";
-    }
-    if (speaking) {
-      btn.classList.add("interrupt");
-    } else if (active) {
-      btn.classList.add("session-active");
-    }
+    if (serverText) { btn.textContent = serverText; }
+    else if (!active) { btn.textContent = "🎤 Wake Up"; }
+    else if (speaking) { btn.textContent = "⚡ Interrupt"; }
+    else { btn.textContent = "🟡 End Session"; }
+    if (speaking) { btn.classList.add("interrupt"); }
+    else if (active) { btn.classList.add("session-active"); }
     if (serverEnabled !== undefined) btn.disabled = !serverEnabled;
   }
 
@@ -1505,36 +1955,80 @@ select.form-inp{cursor:pointer}
     if (cb) cb.style.width = s.cpu + "%"; if (rb) rb.style.width = s.ram + "%";
   }
 
+  // ===== UPDATED v6.1.4: render EQ band values =====
   _renderEqBands() {
-    this._state.eqBands.forEach((v, i) => { const inp = this.querySelector(`input[data-band="${i}"]`); if (inp) inp.value = v; });
+    this._state.eqBands.forEach((v, i) => {
+      const inp = this.querySelector(`input[data-band="${i}"]`); if (inp) inp.value = v;
+      const vl = this.querySelector(`#eqVal${i}`); if (vl) vl.textContent = v > 0 ? `+${v}` : `${v}`;
+    });
   }
+  // ===== END UPDATED =====
 
   _renderPremium() {
-    const isPrem = this._state.premium === 1;
     this._renderCustomAi();
     const ver = this.querySelector(".version");
-    if (ver && isPrem) { ver.textContent = "👑 VIP"; ver.style.color = "#fbbf24"; ver.style.borderColor = "rgba(251,191,36,.3)"; }
+    if (ver && this._state.premium === 1) { ver.textContent = "👑 VIP"; ver.style.color = "#fbbf24"; ver.style.borderColor = "rgba(251,191,36,.3)"; }
   }
 
   _renderAlarms() {
     const el = this.querySelector("#alarmList"); if (!el) return;
     const als = this._state.alarms;
     if (!als.length) { el.innerHTML = '<div style="text-align:center;padding:12px;color:rgba(226,232,240,.4);font-size:11px">Chưa có báo thức</div>'; return; }
-    el.innerHTML = als.map((a, i) => {
+
+    const rpMap = { daily: 'Hàng ngày', weekly: 'Hàng tuần', none: 'Một lần' };
+    const dayNames = {1:'CN',2:'T2',3:'T3',4:'T4',5:'T5',6:'T6',7:'T7'};
+
+    // Dùng a.id (unique) làm key cho data attribute thay vì index mảng
+    el.innerHTML = als.map(a => {
       const t = `${String(a.hour).padStart(2,'0')}:${String(a.minute).padStart(2,'0')}`;
-      const rpMap = { daily: 'Hàng ngày', weekly: 'Hàng tuần', none: 'Một lần' };
-      return `<div class="alarm-item ${a.enabled ? '' : 'o5'}"><div class="fx jcb aic">
-<div><span class="alarm-time">${t}</span>${a.label ? `<span style="font-size:10px;color:rgba(226,232,240,.5);margin-left:6px">${this._esc(a.label)}</span>` : ''}</div>
-<div class="alarm-actions"><button class="form-btn sm" data-altog="${i}">${a.enabled ? '🔔' : '🔕'}</button>
-<button class="form-btn sm" data-aledit="${i}">✏️</button>
-<button class="form-btn sm danger" data-aldel="${i}">✕</button></div></div>
-<div class="alarm-meta">${rpMap[a.repeat] || 'Một lần'} • Vol ${a.volume || 100}%${a.youtube_song_name ? ' • YT: ' + this._esc(a.youtube_song_name) : ''}</div></div>`;
+      const daysStr = Array.isArray(a.selected_days) && a.selected_days.length
+        ? a.selected_days.sort((x,y)=>x-y).map(d=>dayNames[d]||d).join(' ')
+        : '';
+      return `<div class="alarm-item ${a.enabled ? '' : 'o5'}">
+<div class="fx jcb aic">
+  <div>
+    <span class="alarm-time">${t}</span>
+    <span style="font-size:9px;color:rgba(139,92,246,.7);margin-left:6px;font-family:monospace">#${a.id}</span>
+    ${a.label ? `<span style="font-size:10px;color:rgba(226,232,240,.6);margin-left:5px;font-weight:700">${this._esc(a.label)}</span>` : ''}
+  </div>
+  <div class="alarm-actions">
+    <button class="form-btn sm ${a.enabled ? 'green' : ''}" data-altog="${a.id}" title="${a.enabled ? 'Đang bật — nhấn để tắt' : 'Đang tắt — nhấn để bật'}">${a.enabled ? '🔔' : '🔕'}</button>
+    <button class="form-btn sm" data-aledit="${a.id}" title="Chỉnh sửa">✏️</button>
+    <button class="form-btn sm danger" data-aldel="${a.id}" title="Xóa">✕</button>
+  </div>
+</div>
+<div class="alarm-meta">${rpMap[a.repeat] || 'Một lần'}${daysStr ? ' · ' + daysStr : ''} · Vol ${a.volume ?? 100}%${a.youtube_song_name ? ' · 🎵 ' + this._esc(a.youtube_song_name) : ''}</div>
+</div>`;
     }).join("");
-    als.forEach((a, i) => {
-      this._on(`[data-altog="${i}"]`, () => this._send({ action: "alarm_toggle", id: a.id }));
-      this._on(`[data-aledit="${i}"]`, () => this._showAlarmModal(a));
-      this._on(`[data-aldel="${i}"]`, () => { if (confirm("Xóa?")) this._send({ action: "alarm_delete", id: a.id }); });
-    });
+
+    // Event delegation trên container — không bị mất khi rebuild innerHTML
+    if (!el._alarmDelegated) {
+      el._alarmDelegated = true;
+      el.addEventListener('click', (e) => {
+        const tog  = e.target.closest('[data-altog]');
+        const edit = e.target.closest('[data-aledit]');
+        const del  = e.target.closest('[data-aldel]');
+        if (tog) {
+          const id = parseInt(tog.dataset.altog);
+          this._send({ action: "alarm_toggle", alarm_id: id });
+        }
+        if (edit) {
+          const id = parseInt(edit.dataset.aledit);
+          const a  = this._state.alarms.find(x => x.id === id);
+          if (a) this._showAlarmModal(a);
+        }
+        if (del) {
+          const id = parseInt(del.dataset.aldel);
+          const a  = this._state.alarms.find(x => x.id === id);
+          if (!a) return;
+          const t  = `${String(a.hour).padStart(2,'0')}:${String(a.minute).padStart(2,'0')}`;
+          if (confirm(`Xóa báo thức #${a.id} lúc ${t}?`)) {
+            this._pendingDeleteId = id;
+            this._send({ action: "alarm_delete", alarm_id: id });
+          }
+        }
+      });
+    }
   }
 
   _parseProcStats(raw) {
@@ -1587,7 +2081,7 @@ select.form-inp{cursor:pointer}
       const rpt = div.querySelector("#alRpt").value;
       const days = rpt === "weekly" ? Array.from(div.querySelectorAll(".al-day-cb:checked")).map(c => parseInt(c.value)) : undefined;
       const data = { action: isEdit ? "alarm_edit" : "alarm_add", hour: h, minute: m, repeat: rpt, label: div.querySelector("#alLabel").value.trim(), volume: parseInt(div.querySelector("#alVol").value) };
-      if (isEdit) data.id = al.id;
+      if (isEdit) { data.alarm_id = al.id; data.enabled = al.enabled; }  // alarm_edit cần alarm_id + enabled
       const yt = div.querySelector("#alYt").value.trim(); if (yt) data.youtube_song_name = yt;
       if (days) data.selected_days = days;
       this._send(data); div.remove();
@@ -1596,6 +2090,13 @@ select.form-inp{cursor:pointer}
 }
 
 customElements.define("aibox-webui-card", AiBoxCard);
+
 window.customCards = window.customCards || [];
-window.customCards.push({ type: "aibox-webui-card", name: "AI BOX WebUI Card", description: "Full-featured AI BOX control card", preview: true });
-console.log("%c AI BOX WebUI Card v6.1.1 loaded", "color:#a78bfa;font-weight:bold");
+window.customCards.push({
+  type: "aibox-webui-card",
+  name: "AI BOX WebUI Card",
+  description: "Full-featured AI BOX control card",
+  preview: false
+});
+
+console.log("%c AI BOX WebUI Card v6.2.0 loaded", "color:#a78bfa;font-weight:bold");
