@@ -982,7 +982,7 @@ ha-card{border-radius:20px;overflow:hidden;font-family:'Segoe UI',system-ui,sans
 .ctrl-btn.play{width:52px;height:52px;font-size:20px;background:linear-gradient(135deg,#7c3aed,#5b21b6);border:1px solid rgba(139,92,246,.5);box-shadow:0 4px 20px rgba(109,40,217,.4);color:#fff}
 .ctrl-btn.stop{background:rgba(239,68,68,.15);border-color:rgba(239,68,68,.25);color:rgba(239,68,68,.9)}
 .ctrl-btn.active-btn{background:rgba(34,197,94,.15);border-color:rgba(34,197,94,.3);color:rgba(34,197,94,.9)}
-.vol-row{display:flex;align-items:center;gap:8px}
+.vol-row{display:flex;align-items:center;gap:8px;margin-top:10px;padding:0 2px}
 .vol-icon{font-size:12px;color:rgba(226,232,240,.6)}
 .vol-label{font-size:10px;color:rgba(226,232,240,.5);min-width:40px;text-align:right}
 input[type=range]{flex:1;-webkit-appearance:none;height:5px;border-radius:999px;background:rgba(148,163,184,.2);outline:none;cursor:pointer}
@@ -1172,6 +1172,11 @@ select.form-inp{cursor:pointer}
       <button class="ctrl-btn stop" id="btnStop" title="Stop">■</button>
       <button class="ctrl-btn" id="btnNext" title="Next">⏭</button>
     </div>
+    <div class="vol-row">
+      <span class="vol-icon">🔊</span>
+      <input type="range" id="volSlider" min="0" max="15" value="0" />
+      <span class="vol-label" id="volLabel">0</span>
+    </div>
   </div>
   <div class="search-tabs">
     <button class="stab active" data-stab="songs">Songs</button>
@@ -1189,11 +1194,6 @@ select.form-inp{cursor:pointer}
     <div id="plSongs" class="hidden mt6"></div>
   </div>
   <div id="searchResults" class="search-results"></div>
-  <div class="vol-row mt8 mb6">
-    <span class="vol-icon">🔊 Âm lượng</span>
-    <input type="range" id="volSlider" min="0" max="15" value="0" />
-    <span class="vol-label" id="volLabel">Mức 0</span>
-  </div>
 </div>`;
   }
 
