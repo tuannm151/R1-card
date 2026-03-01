@@ -23,6 +23,9 @@ class AiBoxCard extends HTMLElement {
     return null;
   }
 
+  // ============================================================
+  // FIX: setConfig khởi tạo đầy đủ tất cả biến
+  // ============================================================
   setConfig(config) {
     if (!config) throw new Error("Thiếu cấu hình");
     this._config = { ...DEFAULTS, ...(config || {}) };
@@ -42,25 +45,40 @@ class AiBoxCard extends HTMLElement {
 
     if (this._rooms && this._currentRoomIdx === undefined) this._currentRoomIdx = 0;
     this._applyRoomToConfig();
+
+    // WS state
     this._ws = null; this._wsConnected = false;
     this._spkWs = null; this._spkHb = null; this._spkEqHb = null; this._spkReconnect = null;
+
+    // FIX: khởi tạo đầy đủ — tránh undefined khi clearInterval/clearTimeout
+    this._switching = false;
+    this._ctrlPoll = null;
+    this._sysPoll = null;
+    this._progressInterval = null;
+    this._reconnectTimer = null;
+    this._connectTimeout = null;
+    this._toastTimer = null;
+    this._retryCountdownTimer = null;
+    this._volSendTimer = null;
+    this._volLockTimer = null;
+    this._waveRaf = null;
+
     this._activeTab = this._config.default_tab;
     this._activeSearchTab = 'songs';
     this._activeAudioTab = 'eq';
     this._activeLightTab = 'main';
     this._audioOpen = false;
     this._lightOpen = false;
-    this._reconnectTimer = null; this._connectTimeout = null;
-    this._progressInterval = null; this._toastTimer = null;
-    this._volDragging = false; this._volSendTimer = null; this._volLockTimer = null;
+    this._volDragging = false;
     this._ctrlGuard = 0;
     this._audioGuard = 0;
     this._lastCpuIdle = null; this._lastCpuTotal = null;
     this._offline = false;
     this._retryIn = 0;
-    this._retryCountdownTimer = null;
     this._failCount = 0;
     this._dropCount = 0;
+    this._chatLoaded = false;
+    this._waveBars = null; this._waveBalls = null;
 
     this._state = {
       chat: [], chatBg64: "", tiktokReply: false, chatSessionActive: false,
@@ -108,24 +126,52 @@ class AiBoxCard extends HTMLElement {
     }
   }
 
+  // ============================================================
+  // FIX: _switchRoom hoàn chỉnh — xử lý đúng mọi race condition
+  // ============================================================
   _switchRoom(idx) {
     if (!this._rooms || idx === this._currentRoomIdx) return;
+
+    // FIX 5: Hủy mọi pending timer trước khi đổi room
+    clearTimeout(this._reconnectTimer);
+    clearTimeout(this._connectTimeout);
+    clearTimeout(this._spkReconnect);
+    clearInterval(this._retryCountdownTimer);
+    this._reconnectTimer = null;
+    this._connectTimeout = null;
+    this._spkReconnect = null;
+    this._retryCountdownTimer = null;
+
     this._currentRoomIdx = idx;
     this._applyRoomToConfig();
     this._resetState();
+
+    // FIX 3: Set flag trước khi đóng để ngăn onclose trigger reconnect
+    this._switching = true;
     this._closeWs();
+    this._switching = false;
+
+    // Reset các flag
     this._offline = false;
-    clearInterval(this._retryCountdownTimer); this._retryCountdownTimer = null;
     this._failCount = 0;
     this._dropCount = 0;
-    this._renderRoomPills();
-    this._renderMedia(); this._renderVolume();
-    this._renderControlToggles(); this._renderLight();
-    this._renderChatMsgs(); this._renderChatBg(); this._renderTikTok(); this._renderSessionBtn();
-    this._renderSystem(); this._renderAlarms();
-    this._setConnDot(false); this._setConnText("WS");
+    this._chatLoaded = false;
+    this._waveBars = null;
+    this._waveBalls = null;
+    this._retryIn = 0;
+
+    // Re-render toàn bộ UI sạch cho room mới
+    this._render();
+    this._bind();
+    this._setConnDot(false);
+    this._setConnText("WS");
     this._toast("🏠 " + this._rooms[idx].name, "success");
-    setTimeout(() => this._connectWsAuto(), 100);
+
+    // Connect sau 1 tick để đảm bảo DOM đã render xong
+    setTimeout(() => {
+      this._switching = false; // chắc chắn flag đã off
+      this._connectWsAuto();
+    }, 120);
   }
 
   _resetState() {
@@ -198,6 +244,7 @@ class AiBoxCard extends HTMLElement {
   }
 
   _connectWsAuto() {
+    if (this._switching) return; // đang switch room, không connect
     if (this._ws && (this._ws.readyState === 0 || this._ws.readyState === 1)) return;
     clearTimeout(this._reconnectTimer);
     const candidates = this._buildCandidates();
@@ -212,6 +259,7 @@ class AiBoxCard extends HTMLElement {
   _doTry(candidates, idx, attempt) {
     const MAX_PER_URL = 3;
     clearTimeout(this._reconnectTimer);
+    if (this._switching) return; // đang switch room
     if (this._ws && (this._ws.readyState === 0 || this._ws.readyState === 1)) return;
 
     const c = candidates[idx];
@@ -248,6 +296,9 @@ class AiBoxCard extends HTMLElement {
     });
   }
 
+  // ============================================================
+  // FIX: _tryOnce với capturedHost validation + switching guard
+  // ============================================================
   _tryOnce(url, label) {
     return new Promise(resolve => {
       let connected = false, settled = false;
@@ -258,6 +309,9 @@ class AiBoxCard extends HTMLElement {
         resolve(val);
       };
 
+      // Capture host tại thời điểm gọi để validate sau
+      const capturedHost = this._host;
+
       let ws;
       try { ws = new WebSocket(url); } catch (_) { finish(false); return; }
       this._ws = ws;
@@ -267,6 +321,12 @@ class AiBoxCard extends HTMLElement {
       }, this._config.connect_timeout_ms);
 
       ws.onopen = () => {
+        // FIX: Nếu host đã đổi (switch room nhanh), hủy connection này
+        if (this._host !== capturedHost || this._switching) {
+          try { ws.close(); } catch(_) {}
+          finish(false);
+          return;
+        }
         connected = true;
         this._dropCount = 0;
         this._wsConnected = true;
@@ -284,6 +344,9 @@ class AiBoxCard extends HTMLElement {
           this._ws = null;
           finish(false);
         } else {
+          // FIX: Nếu đang switch room thì không xử lý drop
+          if (this._switching) return;
+
           this._wsConnected = false;
           this._setConnDot(false);
           this._setConnText("WS");
@@ -298,26 +361,46 @@ class AiBoxCard extends HTMLElement {
             this._toast("Thiết bị offline sau " + MAX_DROP + " lần drop!", "error");
             this._setOffline(true, 0, MAX_DROP, MAX_DROP);
           } else {
-            this._toast(`Drop ${this._dropCount}/${MAX_DROP} — thiết bị không phản hồi`, "error");
-            this._setOffline(true, 0, this._dropCount, MAX_DROP);
+            this._toast(`Drop ${this._dropCount}/${MAX_DROP} — thử lại...`, "error");
+            this._setOffline(true, this._config.reconnect_ms, this._dropCount, MAX_DROP);
+            // FIX: Tự reconnect sau drop
+            this._reconnectTimer = setTimeout(() => this._connectWsAuto(), this._config.reconnect_ms);
           }
         }
       };
 
       ws.onerror = () => {};
-      ws.onmessage = ev => this._handleMsg(ev.data);
+
+      // FIX: Chỉ xử lý message nếu đúng host
+      ws.onmessage = ev => {
+        if (this._host === capturedHost && !this._switching) this._handleMsg(ev.data);
+      };
     });
   }
 
   _tryConnect(url, label) { return this._tryOnce(url, label); }
 
+  // ============================================================
+  // FIX: _closeWs null handler trước khi close để ngăn onclose fire
+  // ============================================================
   _closeWs() {
-    clearTimeout(this._reconnectTimer); clearTimeout(this._connectTimeout);
-    clearInterval(this._retryCountdownTimer); this._retryCountdownTimer = null;
+    clearTimeout(this._reconnectTimer);
+    clearTimeout(this._connectTimeout);
+    clearInterval(this._retryCountdownTimer);
+    this._retryCountdownTimer = null;
     this._stopTabServices();
-    try { this._ws?.close(); } catch(_) {} this._ws = null; this._wsConnected = false; this._setConnDot(false);
-    this._closeSpkWs();
     this._stopWaveform();
+
+    if (this._ws) {
+      try { this._ws.onclose = null; } catch(_) {} // ngăn onclose trigger reconnect
+      try { this._ws.onerror = null; } catch(_) {}
+      try { this._ws.onmessage = null; } catch(_) {}
+      try { this._ws.close(); } catch(_) {}
+      this._ws = null;
+    }
+    this._wsConnected = false;
+    this._setConnDot(false);
+    this._closeSpkWs();
   }
 
   _send(obj) { if (this._ws?.readyState === 1) this._ws.send(JSON.stringify(obj)); }
@@ -333,28 +416,61 @@ class AiBoxCard extends HTMLElement {
     return base;
   }
 
+  // ============================================================
+  // FIX: _connectSpkWs với capturedHost để tránh race condition
+  // ============================================================
   _connectSpkWs() {
+    if (this._switching) return; // đang switch room, không connect
     if (this._spkWs && (this._spkWs.readyState === 0 || this._spkWs.readyState === 1)) return;
+
     const https = this._isHttps();
     let url;
     if (https) { url = this._spkTunnelWsUrl(); if (!url) return; }
     else { url = this._spkWsUrl(); }
+
+    // FIX: Capture host tại thời điểm connect
+    const capturedHost = this._host;
+
     try {
       this._spkWs = new WebSocket(url);
-      this._spkWs.onopen = () => { this._startSpkHeartbeat(); };
-      this._spkWs.onmessage = ev => this._handleSpkMsg(ev.data);
+      this._spkWs.onopen = () => {
+        // FIX: Kiểm tra host còn khớp không
+        if (this._host !== capturedHost || this._switching) {
+          try { this._spkWs.close(); } catch(_) {}
+          return;
+        }
+        this._startSpkHeartbeat();
+      };
+      this._spkWs.onmessage = ev => {
+        // FIX: Chỉ xử lý nếu đúng host và không đang switch
+        if (this._host === capturedHost && !this._switching) this._handleSpkMsg(ev.data);
+      };
       this._spkWs.onclose = () => {
         this._stopSpkHeartbeat();
         clearTimeout(this._spkReconnect);
-        this._spkReconnect = setTimeout(() => this._connectSpkWs(), 3000);
+        // FIX: Chỉ reconnect nếu host chưa đổi và không đang switch
+        if (!this._switching && this._host === capturedHost) {
+          this._spkReconnect = setTimeout(() => this._connectSpkWs(), 3000);
+        }
       };
       this._spkWs.onerror = () => {};
     } catch(_) {}
   }
 
+  // ============================================================
+  // FIX: _closeSpkWs null handler trước khi close
+  // ============================================================
   _closeSpkWs() {
-    this._stopSpkHeartbeat(); clearTimeout(this._spkReconnect);
-    try { this._spkWs?.close(); } catch(_) {} this._spkWs = null;
+    this._stopSpkHeartbeat();
+    clearTimeout(this._spkReconnect);
+    this._spkReconnect = null;
+    if (this._spkWs) {
+      try { this._spkWs.onclose = null; } catch(_) {} // ngăn onclose trigger reconnect
+      try { this._spkWs.onerror = null; } catch(_) {}
+      try { this._spkWs.onmessage = null; } catch(_) {}
+      try { this._spkWs.close(); } catch(_) {}
+      this._spkWs = null;
+    }
   }
 
   _startSpkHeartbeat() {
@@ -505,9 +621,17 @@ class AiBoxCard extends HTMLElement {
     }
   }
 
+  // ============================================================
+  // FIX: _requestInitial kiểm tra WS connected trước khi loadTab
+  // ============================================================
   _requestInitial() {
-    if (!this._spkWs || this._spkWs.readyState > 1) this._connectSpkWs();
-    else this._startSpkHeartbeat();
+    if (!this._wsConnected) return; // WS phải connected mới proceed
+
+    if (!this._spkWs || this._spkWs.readyState > 1) {
+      this._connectSpkWs();
+    } else {
+      this._startSpkHeartbeat();
+    }
     this._loadTab(this._activeTab, true);
   }
 
@@ -557,11 +681,14 @@ class AiBoxCard extends HTMLElement {
     }
   }
 
+  // ============================================================
+  // FIX: _stopTabServices đảm bảo null hết sau khi clear
+  // ============================================================
   _stopTabServices() {
     this._stopWaveform();
     clearInterval(this._progressInterval);  this._progressInterval = null;
-    clearInterval(this._ctrlPoll);  this._ctrlPoll = null;
-    clearInterval(this._sysPoll);   this._sysPoll = null;
+    clearInterval(this._ctrlPoll);          this._ctrlPoll = null;
+    clearInterval(this._sysPoll);           this._sysPoll = null;
   }
 
   _startProgressTick() {
@@ -572,9 +699,6 @@ class AiBoxCard extends HTMLElement {
     }, 1000);
   }
 
-  // ============================================================
-  // FIX 1: Ball mode — peak độc lập, bars hiển thị đúng
-  // ============================================================
   _startWaveform() {
     this._stopWaveform();
     const BAR_COUNT = 25, MAX_H = 72;
@@ -621,11 +745,9 @@ class AiBoxCard extends HTMLElement {
           vel[i] = vel[i] * 0.68 + (tgt - cur[i]) * 0.26 * dt;
           cur[i] = Math.max(2, Math.min(MAX_H, cur[i] + vel[i]));
         } else {
-          // Ball mode: bar đẩy nhanh lên, về 0px khi chạm peak, đợi peak rơi 2/3 mới đẩy tiếp
           vel[i] = vel[i] * 0.68 + (tgt - cur[i]) * 0.26 * dt;
           const newH = Math.max(0, Math.min(MAX_H, cur[i] + vel[i]));
 
-          // Peak rơi độc lập, chậm hơn để tự nhiên
           if (peak[i] > 3) {
             pvel[i] += 0.018 * dt;
             peak[i] = Math.max(3, peak[i] - pvel[i]);
@@ -633,7 +755,7 @@ class AiBoxCard extends HTMLElement {
 
           if (locked[i]) {
             cur[i] = 0;
-            if (peak[i] <= 6) { // peak phải rơi gần sát đáy mới unlock
+            if (peak[i] <= 6) {
               locked[i] = 0;
               lockAt[i] = 0;
             }
@@ -863,79 +985,29 @@ ha-card{border-radius:20px;overflow:hidden;font-family:'Segoe UI',system-ui,sans
 .mc-source{font-size:9px;padding:3px 8px;border-radius:6px;background:rgba(109,40,217,.3);border:1px solid rgba(139,92,246,.3);color:#c4b5fd;font-weight:800;letter-spacing:1px}
 .mc-icon-btn{width:28px;height:28px;border-radius:50%;border:1px solid rgba(148,163,184,.15);background:transparent;color:rgba(226,232,240,.5);cursor:pointer;font-size:13px;display:grid;place-items:center;transition:all .15s}
 .mc-icon-btn:hover{background:rgba(109,40,217,.2)}.mc-icon-btn.active-btn{color:#86efac;border-color:rgba(34,197,94,.3)}
-.mc-vis{
-  position:relative;border-radius:14px;overflow:hidden;margin-bottom:0;
-  border:1px solid rgba(139,92,246,.2);
-  background:linear-gradient(135deg,#0c0618 0%,#12082a 100%);display:flex;flex-direction:column;
-}
-.mc-bg{
-  position:absolute;inset:0;z-index:0;
-  background-size:cover;background-position:center;
-  filter:blur(18px) brightness(.75) saturate(1.5);
-  transform:scale(1.25);
-  opacity:0;transition:opacity .6s ease;
-}
+.mc-vis{position:relative;border-radius:14px;overflow:hidden;margin-bottom:0;border:1px solid rgba(139,92,246,.2);background:linear-gradient(135deg,#0c0618 0%,#12082a 100%);display:flex;flex-direction:column;}
+.mc-bg{position:absolute;inset:0;z-index:0;background-size:cover;background-position:center;filter:blur(18px) brightness(.75) saturate(1.5);transform:scale(1.25);opacity:0;transition:opacity .6s ease;}
 .mc-bg.show{opacity:1}
-.mc-vis::after{
-  content:'';position:absolute;inset:0;z-index:1;
-  background:linear-gradient(to bottom,rgba(4,2,12,.05) 0%,rgba(4,2,12,.25) 100%);
-  pointer-events:none;
-}
-/* FIX 2: mc-top đảo chiều — đĩa nhạc phải, waveform trái */
-.mc-top{
-  display:flex;align-items:center;gap:11px;
-  padding:12px 14px;position:relative;z-index:2;flex:1;
-  flex-direction:row-reverse;
-}
-.mc-thumb-wrap{
-  width:72px;height:72px;border-radius:50%;overflow:hidden;flex-shrink:0;
-  border:2.5px solid rgba(139,92,246,.55);
-  box-shadow:0 0 20px rgba(109,40,217,.5);position:relative;
-}
+.mc-vis::after{content:'';position:absolute;inset:0;z-index:1;background:linear-gradient(to bottom,rgba(4,2,12,.05) 0%,rgba(4,2,12,.25) 100%);pointer-events:none;}
+.mc-top{display:flex;align-items:center;gap:11px;padding:12px 14px;position:relative;z-index:2;flex:1;flex-direction:row-reverse;}
+.mc-thumb-wrap{width:72px;height:72px;border-radius:50%;overflow:hidden;flex-shrink:0;border:2.5px solid rgba(139,92,246,.55);box-shadow:0 0 20px rgba(109,40,217,.5);position:relative;}
 .mc-thumb{width:100%;height:100%;object-fit:cover}
 .mc-thumb.spin{animation:sp 12s linear infinite}@keyframes sp{to{transform:rotate(360deg)}}
 .mc-thumb-fb{width:100%;height:100%;display:grid;place-items:center;background:rgba(109,40,217,.18);font-size:28px}
-/* FIX 2: waveform-wrap chiếm toàn bộ phần còn lại bên trái */
-.waveform-wrap{
-  display:flex;flex-direction:column;align-items:flex-start;
-  flex:1;height:72px;overflow:hidden;position:relative;z-index:2;
-}
+.waveform-wrap{display:flex;flex-direction:column;align-items:flex-start;flex:1;height:72px;overflow:hidden;position:relative;z-index:2;}
 .waveform{display:flex;align-items:flex-end;justify-content:space-evenly;flex:1;width:100%}
-/* FIX 3: nút waveform style lớn hơn, dễ thấy */
-.wv-style-btn{
-  flex-shrink:0;width:28px;height:28px;border-radius:50%;
-  border:1px solid rgba(139,92,246,.45);
-  background:rgba(109,40,217,.25);
-  color:rgba(167,139,250,.95);
-  cursor:pointer;font-size:14px;
-  display:grid;place-items:center;
-  align-self:flex-start;
-  margin:0 0 4px 2px;
-  transition:all .15s;padding:0;line-height:1;
-}
+.wv-style-btn{flex-shrink:0;width:28px;height:28px;border-radius:50%;border:1px solid rgba(139,92,246,.45);background:rgba(109,40,217,.25);color:rgba(167,139,250,.95);cursor:pointer;font-size:14px;display:grid;place-items:center;align-self:flex-start;margin:0 0 4px 2px;transition:all .15s;padding:0;line-height:1;}
 .wv-style-btn:hover{background:rgba(109,40,217,.5);border-color:rgba(139,92,246,.7);transform:scale(1.1)}
 .wv-col{display:flex;flex-direction:column;align-items:center;justify-content:flex-end;position:relative;flex:1;height:100%}
 .wv-bar{width:3px;flex-shrink:0;background:linear-gradient(to top,rgba(88,28,220,.7),rgba(167,139,250,.9));border-radius:2px 2px 1px 1px;will-change:height;height:3px;opacity:.9}
 .wv-ball{position:absolute;bottom:3px;width:5px;height:5px;border-radius:50%;background:#c4b5fd;box-shadow:0 0 4px rgba(167,139,250,.8);left:50%;transform:translateX(-50%);transition:bottom 0.05s linear;pointer-events:none}
-.mc-seek-wrap{
-  position:relative;z-index:2;padding:4px 12px 10px 12px;flex-shrink:0;
-}
+.mc-seek-wrap{position:relative;z-index:2;padding:4px 12px 10px 12px;flex-shrink:0;}
 .mc-seek-row{display:flex;align-items:center;gap:7px}
-.mc-seek-bar{
-  flex:1;height:3px;border-radius:2px;background:rgba(255,255,255,.12);
-  cursor:pointer;position:relative;overflow:visible;
-}
-.mc-seek-fill{
-  height:100%;background:linear-gradient(to right,#6d28d9,#a78bfa);
-  border-radius:2px;transition:width .4s linear;pointer-events:none;
-}
-.mc-seek-thumb{
-  position:absolute;top:50%;right:calc(100% - var(--spct,0%));
-  transform:translate(50%,-50%);
-  width:11px;height:11px;border-radius:50%;background:#c4b5fd;
-  box-shadow:0 0 6px rgba(167,139,250,.7);opacity:0;transition:opacity .15s;pointer-events:none;
-}
+.mc-seek-bar{flex:1;height:3px;border-radius:2px;background:rgba(255,255,255,.12);cursor:pointer;position:relative;overflow:visible;}
+.mc-seek-fill{height:100%;background:linear-gradient(to right,#6d28d9,#a78bfa);border-radius:2px;transition:width .4s linear;pointer-events:none;}
+.mc-seek-thumb{position:absolute;top:50%;right:calc(100% - var(--spct,0%));transform:translate(50%,-50%);width:11px;height:11px;border-radius:50%;background:#c4b5fd;box-shadow:0 0 6px rgba(167,139,250,.7);opacity:0;transition:opacity .15s;pointer-events:none;}
 .mc-seek-bar:hover .mc-seek-thumb{opacity:1}
+@media(hover:none){.mc-seek-thumb{opacity:1!important}}
 .progress-row{display:flex;align-items:center;gap:8px;margin-bottom:12px}
 .time-txt{font-size:10px;color:rgba(226,232,240,.55);min-width:32px;font-family:monospace}
 .time-txt.right{text-align:right}
@@ -962,7 +1034,7 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;heigh
 .search-results{max-height:160px;overflow-y:auto}
 .search-results::-webkit-scrollbar{width:4px}
 .search-results::-webkit-scrollbar-thumb{background:rgba(139,92,246,.3);border-radius:999px}
-.result-item{display:flex;align-items:center;gap:8px;padding:7px 8px;border-radius:10px;cursor:pointer;border:1px solid transparent;transition:all .15px;margin-bottom:4px}
+.result-item{display:flex;align-items:center;gap:8px;padding:7px 8px;border-radius:10px;cursor:pointer;border:1px solid transparent;transition:all .15s;margin-bottom:4px}
 .result-item:hover{background:rgba(109,40,217,.2);border-color:rgba(139,92,246,.2)}
 .result-thumb{width:36px;height:36px;border-radius:8px;object-fit:cover;background:rgba(109,40,217,.2);flex-shrink:0;font-size:16px;display:grid;place-items:center}
 .result-info{flex:1;min-width:0}
@@ -1070,7 +1142,7 @@ select.form-inp{cursor:pointer}
 .toast.error{border-color:rgba(239,68,68,.3);color:#fca5a5}
 .fx{display:flex}.aic{align-items:center}.jcb{justify-content:space-between}.g4{gap:4px}.g6{gap:6px}.g8{gap:8px}.mt6{margin-top:6px}.mt8{margin-top:8px}.mb6{margin-bottom:6px}.mb8{margin-bottom:8px}.f1{flex:1;min-width:0}.o5{opacity:.5}
 .hidden{display:none!important}
-@media(max-width:480px){.wrap{padding:10px 10px 8px}.title-text{font-size:14px}.badge-icon{width:28px;height:28px;font-size:13px}.tabs{padding:4px;gap:4px}.tab{font-size:10px;padding:7px 4px}.body{height:460px}.mc-thumb-wrap{width:60px;height:60px}.mc-vis{height:86px}.mc-title{font-size:13px}.ctrl-btn{width:34px;height:34px;font-size:13px}.ctrl-btn.play{width:46px;height:46px;font-size:18px}.msgs{height:200px}.bubble{font-size:11px}.toggle-left .tog-name{font-size:11px}.sw{width:38px;height:22px}.sw::after{width:14px;height:14px;top:3px;left:3px}.sw.on::after{left:19px}.rbtn{font-size:10px;padding:4px 8px}.eq-band input[type=range]{height:70px}.eq-band-val{font-size:9px}}
+@media(max-width:480px){.wrap{padding:10px 10px 8px}.title-text{font-size:14px}.badge-icon{width:28px;height:28px;font-size:13px}.tabs{padding:4px;gap:4px}.tab{font-size:10px;padding:7px 4px}.body{height:auto;min-height:420px;max-height:90vh}.mc-thumb-wrap{width:60px;height:60px}.waveform-wrap{height:60px!important}.mc-title{font-size:13px}.ctrl-btn{width:34px;height:34px;font-size:13px}.ctrl-btn.play{width:46px;height:46px;font-size:18px}.msgs{height:200px}.bubble{font-size:11px}.toggle-left .tog-name{font-size:11px}.sw{width:38px;height:22px}.sw::after{width:14px;height:14px;top:3px;left:3px}.sw.on::after{left:19px}.rbtn{font-size:10px;padding:4px 8px}.eq-band input[type=range]{height:70px}.eq-band-val{font-size:9px}input[type=range]::-webkit-slider-thumb{width:20px;height:20px}.mc-seek-thumb{opacity:1!important;width:14px;height:14px}}
 </style>
 `;
     this._setConnDot(this._wsConnected);
@@ -1085,9 +1157,6 @@ select.form-inp{cursor:pointer}
     this._renderSystem(); this._renderAlarms();
   }
 
-  // ============================================================
-  // FIX 2: Layout đĩa nhạc phải — waveform + nút trái
-  // ============================================================
   _panelMedia(tab) {
     let wvContent = '';
     for (let i = 0; i < 25; i++) {
@@ -1315,11 +1384,21 @@ select.form-inp{cursor:pointer}
       if (newTab === this._activeTab) return;
       this._activeTab = newTab;
       this._render(); this._bind();
-      this._loadTab(newTab);
+      // FIX: Chỉ loadTab nếu WS đã connected
+      if (this._wsConnected) this._loadTab(newTab);
     }; });
 
     this._on("#btnWaveStyle", () => this._toggleWaveStyle());
-    this._on("#seekWrap", null, el => { el.onclick = e => { const m = this._state.media; if (!m.duration) return; const r = el.getBoundingClientRect(); const pos = Math.floor(m.duration * Math.max(0, Math.min(1, (e.clientX - r.left) / r.width))); m.position = pos; this._send({ action: "seek", position: pos }); this._updateProgressOnly(); }; });
+    this._on("#seekWrap", null, el => {
+      const doSeek = (clientX) => {
+        const m = this._state.media; if (!m.duration) return;
+        const r = el.getBoundingClientRect();
+        const pos = Math.floor(m.duration * Math.max(0, Math.min(1, (clientX - r.left) / r.width)));
+        m.position = pos; this._send({ action: "seek", position: pos }); this._updateProgressOnly();
+      };
+      el.onclick = e => doSeek(e.clientX);
+      el.addEventListener('touchend', e => { e.preventDefault(); doSeek(e.changedTouches[0].clientX); }, { passive: false });
+    });
     this._on("#btnPlayPause", () => {
       if (this._state.media.isPlaying) this._send({ action: "pause" });
       else this._send({ action: "resume" });
@@ -1958,8 +2037,9 @@ select.form-inp{cursor:pointer}
 </div>`;
     }).join("");
 
-    if (!el._alarmDelegated) {
-      el._alarmDelegated = true;
+    // FIX: Dùng flag trên instance thay vì DOM element để tránh leak sau re-render
+    if (!this._alarmListenerBound) {
+      this._alarmListenerBound = true;
       el.addEventListener('click', (e) => {
         const tog  = e.target.closest('[data-altog]');
         const edit = e.target.closest('[data-aledit]');
@@ -2055,4 +2135,4 @@ window.customCards.push({
   preview: false
 });
 
-console.log("%c AI BOX WebUI Card v6.3.1 loaded", "color:#a78bfa;font-weight:bold");
+console.log("%c AI BOX WebUI Card v6.4.0 loaded", "color:#a78bfa;font-weight:bold");
