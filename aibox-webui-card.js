@@ -625,15 +625,15 @@ class AiBoxCard extends HTMLElement {
           vel[i] = vel[i] * 0.68 + (tgt - cur[i]) * 0.26 * dt;
           const newH = Math.max(0, Math.min(MAX_H, cur[i] + vel[i]));
 
-          // Peak rơi độc lập
+          // Peak rơi độc lập, chậm hơn để tự nhiên
           if (peak[i] > 3) {
-            pvel[i] += 0.045 * dt;
+            pvel[i] += 0.018 * dt;
             peak[i] = Math.max(3, peak[i] - pvel[i]);
           }
 
           if (locked[i]) {
             cur[i] = 0;
-            if (peak[i] <= 10) { // peak rơi xuống dưới 10px mới unlock
+            if (peak[i] <= 6) { // peak phải rơi gần sát đáy mới unlock
               locked[i] = 0;
               lockAt[i] = 0;
             }
