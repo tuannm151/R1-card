@@ -1,37 +1,3 @@
-/* AI BOX WebUI Card v6.2.0 for Home Assistant
- * + Multi-Room / Multi-Device selector
- * + IP-based tunnel routing (?ip=<device_ip>)
- * + Collapsible Audio Engine & Lighting Control
- * - Removed Stereo Mode
- * FIX v6.1.3:
- *   - Tunnel connect/drop loop đã được fix: sau MAX_DROP lần drop → offline hẳn, không loop
- *   - _dropCount reset đúng khi user bấm "Thử lại" hoặc đổi room
- *   - HTTP: chỉ thử LAN WS 3 lần rồi dừng
- *   - HTTPS: chỉ thử tunnel WSS 3 lần rồi dừng
- * UPDATE v6.1.4:
- *   - EQ bands phân bổ đều toàn chiều rộng card, có giá trị dB hiển thị trên mỗi cột
- *   - Waveform media tab chiếm toàn bộ chiều rộng card, hiệu ứng rõ và đẹp hơn
- * UPDATE v6.1.5:
- *   - Dynamic audio visualizer: waveform bars chạy bằng requestAnimationFrame
- *   - Physics-based spring animation: mỗi bar có velocity riêng, chasing target height
- *   - Beat simulation với BPM ngẫu nhiên, bass/mid/treble band shape thực tế
- *   - Khi phát nhạc: bars nhảy dynamic theo beat & spectrum; Khi dừng: idle breathing nhẹ
- * UPDATE v6.1.6:
- *   - Waveform: bell curve envelope giống web version, 60 bars, rộng và cao hơn
- *   - Background blur từ thumbnail trải full width trong mc-vis
- *   - Seekbar nằm trong mc-vis (không tách riêng)
- *   - Thumb tròn nằm trên góc trái waveform
- * UPDATE v6.1.6:
- *   - FIX ALARM: dùng alarm_id (thay vì id) cho toggle/delete/edit đúng protocol server
- *   - Cập nhật alarm list optimistically (không cần gọi lại alarm_list sau mỗi action)
- *   - UI alarm: hiển thị #id, ngày trong tuần, nút 🔔 đổi màu xanh khi bật
- *   - Toast thông báo sau mỗi thao tác thêm/sửa/xóa
- * UPDATE v6.1.7:
- *   - FIX: action gửi LÊN server dùng "alarm_id"; response TỪ server dùng "alarm.id"
- *   - FIX alarm_deleted: server không trả về id trong response → dùng _pendingDeleteId
- *   - FIX alarm_toggled: fallback reload alarm_list nếu response không có alarm object
- */
-
 const DEFAULTS = {
   host: "", ws_port: 8082, speaker_port: 8080, http_port: 8081,
   tunnel_host: "", tunnel_port: 443, tunnel_path: "/",
@@ -86,7 +52,6 @@ class AiBoxCard extends HTMLElement {
     this._lightOpen = false;
     this._reconnectTimer = null; this._connectTimeout = null;
     this._progressInterval = null; this._toastTimer = null;
-    this._waveRaf = null; this._waveBars = null;
     this._volDragging = false; this._volSendTimer = null; this._volLockTimer = null;
     this._ctrlGuard = 0;
     this._audioGuard = 0;
@@ -305,12 +270,12 @@ class AiBoxCard extends HTMLElement {
         connected = true;
         this._dropCount = 0;
         this._wsConnected = true;
-        this._chatLoaded = false; // reconnect → load lại history
+        this._chatLoaded = false;
         this._setConnDot(true);
         this._setConnText(label);
         this._setOffline(false);
         this._toast("Đã kết nối: " + label, "success");
-        this._requestInitial(); // load data cho tab đang active
+        this._requestInitial();
         finish(true);
       };
 
@@ -541,28 +506,21 @@ class AiBoxCard extends HTMLElement {
   }
 
   _requestInitial() {
-    // Kết nối spkWs ngay — heartbeat 950ms chạy liên tục bất kể tab nào
     if (!this._spkWs || this._spkWs.readyState > 1) this._connectSpkWs();
     else this._startSpkHeartbeat();
-    // Chỉ load data cho tab đang active — các tab khác load khi kích vào
     this._loadTab(this._activeTab, true);
   }
 
-  // Load dữ liệu cho từng tab, stop services của tab cũ
   _loadTab(tab, isFirst = false) {
-    // ── Stop services của tất cả tab ──────────────────────────
     this._stopTabServices();
 
-    // ── Media tab ─────────────────────────────────────────────
     if (tab === 'media') {
-      this._send({ action: 'get_info' });   // volume, playback state
+      this._send({ action: 'get_info' });
       this._startProgressTick();
       this._startWaveform();
-      // spkWs đã luôn kết nối từ _requestInitial, không cần start lại
 
-    // ── Control tab ───────────────────────────────────────────
     } else if (tab === 'control') {
-      this._send({ action: 'get_info' });  // ngay lập tức
+      this._send({ action: 'get_info' });
       this._send({ action: 'alarm_list' });
       this._send({ action: 'led_get_state' });
       this._send({ action: 'wake_word_get_enabled' });
@@ -570,13 +528,11 @@ class AiBoxCard extends HTMLElement {
       this._send({ action: 'custom_ai_get_enabled' });
       this._send({ action: 'voice_id_get' });
       this._send({ action: 'live2d_get_model' });
-      // Poll nhẹ sau đó
       this._ctrlPoll = setInterval(() => {
         this._send({ action: 'led_get_state' });
         this._send({ action: 'get_info' });
       }, 5000);
 
-    // ── Chat tab ──────────────────────────────────────────────
     } else if (tab === 'chat') {
       this._send({ action: 'get_info' });
       if (!this._chatLoaded) {
@@ -585,7 +541,6 @@ class AiBoxCard extends HTMLElement {
       this._send({ action: 'get_chat_background' });
       this._send({ action: 'custom_ai_get_enabled' });
 
-    // ── System tab ────────────────────────────────────────────
     } else if (tab === 'system') {
       this._send({ action: 'get_info' });
       this._send({ action: 'get_device_info' });
@@ -595,7 +550,6 @@ class AiBoxCard extends HTMLElement {
       this._send({ action: 'wifi_get_saved' });
       this._send({ action: 'mac_get' });
       this._send({ action: 'get_premium_status' });
-      // Poll system stats mỗi 3s chỉ khi đang xem System
       this._sysPoll = setInterval(() => {
         this._send({ action: 'get_info' });
         this._send({ action: 'get_device_info' });
@@ -603,17 +557,11 @@ class AiBoxCard extends HTMLElement {
     }
   }
 
-  // Dừng TẤT CẢ background services của tab
   _stopTabServices() {
-    // Waveform + progress — chỉ dùng ở Media
     this._stopWaveform();
     clearInterval(this._progressInterval);  this._progressInterval = null;
-    // Control poll
     clearInterval(this._ctrlPoll);  this._ctrlPoll = null;
-    // System poll
     clearInterval(this._sysPoll);   this._sysPoll = null;
-    // SpkWs heartbeat KHÔNG dừng ở đây — luôn chạy sau khi connect
-    // Chỉ dừng khi WS disconnect (_closeWs / onclose)
   }
 
   _startProgressTick() {
@@ -624,109 +572,125 @@ class AiBoxCard extends HTMLElement {
     }, 1000);
   }
 
-  // ===== Dynamic Audio Visualizer Engine v6.1.5 =====
+  // ============================================================
+  // FIX 1: Ball mode — peak độc lập, bars hiển thị đúng
+  // ============================================================
   _startWaveform() {
     this._stopWaveform();
-    const BAR_COUNT = 60;
-    const MAX_H = 72;
+    const BAR_COUNT = 25, MAX_H = 72;
 
-    // Smooth per-bar state
-    const cur = new Float32Array(BAR_COUNT).fill(3);
-    const vel = new Float32Array(BAR_COUNT).fill(0);
-
-    // Bell curve envelope — shape cố định, xác định chiều cao tối đa mỗi bar
-    const envelope = new Float32Array(BAR_COUNT).map((_, i) => {
-      const x = i / (BAR_COUNT - 1);
-      const d = Math.abs(x - 0.5);
+    const cur  = new Float32Array(BAR_COUNT).fill(3);
+    const vel  = new Float32Array(BAR_COUNT).fill(0);
+    const envelope = Float32Array.from({length: BAR_COUNT}, (_, i) => {
+      const d = Math.abs(i / (BAR_COUNT - 1) - 0.5);
       return 0.15 + 0.85 * Math.exp(-Math.pow(d / 0.35, 2));
     });
+    let w1 = 0, w2 = 0, w3 = 0, beatAmp = 0, beatTgt = 0;
+    let bpm = 118 + Math.random() * 30, frameSinceBeat = 0, lastTs = 0;
 
-    // Shared oscillators — tất cả bars đều "nhìn" vào cùng wave
-    // Wave 1: sóng chậm, tạo hình dạng chính
-    // Wave 2: sóng nhanh hơn, tạo răng cưa/chi tiết
-    // Wave 3: traveling wave từ trái → phải (như âm thanh lan truyền)
-    let w1 = 0, w2 = 0, w3 = 0;       // phase của 3 wave chính
-    let beatAmp = 0, beatTgt = 0;
-    let bpm = 118 + Math.random() * 30;
-    let frameSinceBeat = 0, lastTs = 0;
+    const peak   = new Float32Array(BAR_COUNT).fill(3);
+    const pvel   = new Float32Array(BAR_COUNT).fill(0);
+    const lockAt = new Float32Array(BAR_COUNT).fill(0);
+    const locked = new Uint8Array(BAR_COUNT).fill(0);
 
     const tick = (ts) => {
       this._waveRaf = requestAnimationFrame(tick);
-      const dt = Math.min((ts - (lastTs || ts)) / 16.67, 3);
-      lastTs = ts;
+      const dt = Math.min((ts - (lastTs || ts)) / 16.67, 3); lastTs = ts;
       const isPlaying = this._state.media.isPlaying;
+      const curMode = this._waveStyle || 'ball';
 
-      // Tiến phase các wave chung
-      w1 += 0.018 * dt;   // chậm ~1.1Hz
-      w2 += 0.041 * dt;   // nhanh ~2.5Hz
-      w3 += 0.027 * dt;   // traveling wave
-
-      // Beat simulation
-      const fpb = (60 / bpm) * 60;
-      frameSinceBeat += dt;
+      w1 += 0.0045 * dt; w2 += 0.010 * dt; w3 += 0.0065 * dt;
+      const fpb = (60 / bpm) * 60; frameSinceBeat += dt;
       if (frameSinceBeat >= fpb) {
         frameSinceBeat -= fpb;
         beatTgt = isPlaying ? (0.6 + Math.random() * 0.4) : 0;
-        bpm += (Math.random() - 0.5) * 4;
-        bpm = Math.max(85, Math.min(170, bpm));
+        bpm += (Math.random() - 0.5) * 2; bpm = Math.max(22, Math.min(42, bpm));
       }
-      beatAmp += (beatTgt - beatAmp) * 0.3 * dt;
-      beatTgt  *= Math.pow(0.82, dt);
+      beatAmp += (beatTgt - beatAmp) * 0.08 * dt; beatTgt *= Math.pow(0.82, dt);
 
       for (let i = 0; i < BAR_COUNT; i++) {
-        const env = envelope[i];
-        // Vị trí chuẩn hóa 0..1
-        const x = i / (BAR_COUNT - 1);
+        const env = envelope[i], x = i / (BAR_COUNT - 1);
+        const travelOffset = x * Math.PI * 3.5;
+        const s1 = Math.sin(w1 * 2 * Math.PI + travelOffset) * 0.5 + 0.5;
+        const s2 = Math.sin(w2 * 2 * Math.PI + travelOffset * 1.7) * 0.3 + 0.3;
+        const s3 = Math.abs(Math.sin(w3 * 2 * Math.PI + travelOffset * 0.8));
+        const beatPulse = beatAmp * (0.6 + 0.4 * Math.sin(w1 * Math.PI * 4));
+        const tgt = 4 + (s1 * 0.45 + s2 * 0.30 + s3 * 0.15 + beatPulse * 0.40) * env * MAX_H;
 
-        let tgt;
-        if (isPlaying) {
-          // Tất cả bars dùng CÙNG wave, chỉ khác pha theo vị trí (traveling effect)
-          const travelOffset = x * Math.PI * 3.5;  // sóng lan từ trái sang phải
-          const s1 = Math.sin(w1 * 2 * Math.PI + travelOffset) * 0.5 + 0.5;
-          const s2 = Math.sin(w2 * 2 * Math.PI + travelOffset * 1.7) * 0.3 + 0.3;
-          const s3 = Math.abs(Math.sin(w3 * 2 * Math.PI + travelOffset * 0.8)); // rectified
-
-          // Beat: toàn bộ spectrum bật lên cùng lúc (đặc trưng của beat)
-          const beatPulse = beatAmp * (0.6 + 0.4 * Math.sin(w1 * Math.PI * 4));
-
-          // Kết hợp — envelope kiểm soát biên độ theo vị trí
-          const combined = (s1 * 0.45 + s2 * 0.30 + s3 * 0.15 + beatPulse * 0.40) * env;
-          tgt = 4 + combined * MAX_H;
-
-          // Micro-spike lúc beat hit (chỉ bars có envelope cao)
-          if (frameSinceBeat < 2 && Math.random() < 0.25 * env)
-            tgt = Math.min(MAX_H, tgt * (1.2 + Math.random() * 0.3));
+        if (curMode === 'classic') {
+          vel[i] = vel[i] * 0.68 + (tgt - cur[i]) * 0.26 * dt;
+          cur[i] = Math.max(2, Math.min(MAX_H, cur[i] + vel[i]));
         } else {
-          // Idle: sóng nhẹ nhàng đồng bộ, giữ hình bell curve
-          tgt = 3 + Math.sin(w1 * 2 * Math.PI + x * Math.PI) * 3 * env;
-        }
+          // Ball mode: bar đẩy nhanh lên, về 0px khi chạm peak, đợi peak rơi 2/3 mới đẩy tiếp
+          vel[i] = vel[i] * 0.68 + (tgt - cur[i]) * 0.26 * dt;
+          const newH = Math.max(0, Math.min(MAX_H, cur[i] + vel[i]));
 
-        // Spring damping physics
-        vel[i] = vel[i] * 0.68 + (tgt - cur[i]) * 0.26 * dt;
-        cur[i] = Math.max(2, Math.min(MAX_H, cur[i] + vel[i]));
+          // Peak rơi độc lập
+          if (peak[i] > 3) {
+            pvel[i] += 0.045 * dt;
+            peak[i] = Math.max(3, peak[i] - pvel[i]);
+          }
+
+          if (locked[i]) {
+            cur[i] = 0;
+            if (peak[i] <= 10) { // peak rơi xuống dưới 10px mới unlock
+              locked[i] = 0;
+              lockAt[i] = 0;
+            }
+          } else {
+            cur[i] = newH;
+            if (cur[i] >= peak[i] && cur[i] > 8) {
+              peak[i] = cur[i];
+              pvel[i] = 0;
+              lockAt[i] = cur[i];
+              locked[i] = 1;
+              cur[i] = 0;
+            }
+          }
+        }
       }
 
       const bars = this._waveBars;
+      const balls = this._waveBalls;
       if (!bars || bars.length !== BAR_COUNT) {
         const wv = this.querySelector('#waveform');
-        if (wv) this._waveBars = wv.querySelectorAll('.wv-bar');
+        if (wv) { this._waveBars = wv.querySelectorAll('.wv-bar'); this._waveBalls = wv.querySelectorAll('.wv-ball'); }
         return;
       }
       for (let i = 0; i < BAR_COUNT; i++) {
         bars[i].style.height = cur[i] + 'px';
+        if (balls && balls[i]) balls[i].style.bottom = peak[i] + 'px';
       }
     };
 
     const wv = this.querySelector('#waveform');
-    if (wv) this._waveBars = wv.querySelectorAll('.wv-bar');
+    if (wv) { this._waveBars = wv.querySelectorAll('.wv-bar'); this._waveBalls = wv.querySelectorAll('.wv-ball'); }
     this._waveRaf = requestAnimationFrame(tick);
   }
 
   _stopWaveform() {
     if (this._waveRaf) { cancelAnimationFrame(this._waveRaf); this._waveRaf = null; }
-    this._waveBars = null;
+    this._waveBars = null; this._waveBalls = null;
   }
-  // ===== End Visualizer Engine =====
+
+  _toggleWaveStyle() {
+    this._waveStyle = (this._waveStyle || 'ball') === 'ball' ? 'classic' : 'ball';
+    const wv = this.querySelector('#waveform');
+    if (wv) {
+      if (this._waveStyle === 'classic') {
+        let html = ''; for (let i = 0; i < 25; i++) html += `<div class="wv-col"><div class="wv-ball" style="display:none"></div><div class="wv-bar"></div></div>`;
+        wv.innerHTML = html;
+      } else {
+        let html = ''; for (let i = 0; i < 25; i++) html += `<div class="wv-col"><div class="wv-ball"></div><div class="wv-bar"></div></div>`;
+        wv.innerHTML = html;
+      }
+      this._waveBars  = wv.querySelectorAll('.wv-bar');
+      this._waveBalls = wv.querySelectorAll('.wv-ball');
+    }
+    const btn = this.querySelector('#btnWaveStyle');
+    if (btn) btn.textContent = this._waveStyle === 'classic' ? '≡' : '⚬';
+    this._toast(this._waveStyle === 'classic' ? '≡ Classic bars' : '⚬ Peak ball', 'success');
+  }
 
   _fmtTime(s) { s = Math.max(0, Math.floor(Number(s || 0))); return `${Math.floor(s/60)}:${String(s%60).padStart(2,"0")}`; }
   _esc(s) { return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
@@ -858,7 +822,6 @@ ha-card{border-radius:20px;overflow:hidden;font-family:'Segoe UI',system-ui,sans
 .brand{display:flex;align-items:center;gap:9px}
 .badge-icon{width:34px;height:34px;border-radius:10px;background:linear-gradient(135deg,rgba(109,40,217,.4),rgba(67,20,120,.4));border:1px solid rgba(139,92,246,.35);display:grid;place-items:center;font-size:16px}
 .title-text{font-weight:900;font-size:16px;color:#e2e8f0;letter-spacing:.5px}
-.version{font-size:10px;padding:2px 8px;border-radius:999px;color:#a78bfa;border:1px solid rgba(139,92,246,.3);background:rgba(139,92,246,.1)}
 .conn-row{display:flex;align-items:center;gap:7px}
 .dot{width:9px;height:9px;border-radius:50%;background:rgba(239,68,68,.9);box-shadow:0 0 8px rgba(239,68,68,.4);transition:all .3s}
 .dot.on{background:rgba(34,197,94,.9);box-shadow:0 0 10px rgba(34,197,94,.5)}
@@ -900,31 +863,29 @@ ha-card{border-radius:20px;overflow:hidden;font-family:'Segoe UI',system-ui,sans
 .mc-source{font-size:9px;padding:3px 8px;border-radius:6px;background:rgba(109,40,217,.3);border:1px solid rgba(139,92,246,.3);color:#c4b5fd;font-weight:800;letter-spacing:1px}
 .mc-icon-btn{width:28px;height:28px;border-radius:50%;border:1px solid rgba(148,163,184,.15);background:transparent;color:rgba(226,232,240,.5);cursor:pointer;font-size:13px;display:grid;place-items:center;transition:all .15s}
 .mc-icon-btn:hover{background:rgba(109,40,217,.2)}.mc-icon-btn.active-btn{color:#86efac;border-color:rgba(34,197,94,.3)}
-/* ===== UPDATED v6.1.6: Web-style waveform visual area ===== */
 .mc-vis{
   position:relative;border-radius:14px;overflow:hidden;margin-bottom:0;
-  height:156px;border:1px solid rgba(139,92,246,.2);
-  background:#080416;display:flex;flex-direction:column;
+  border:1px solid rgba(139,92,246,.2);
+  background:linear-gradient(135deg,#0c0618 0%,#12082a 100%);display:flex;flex-direction:column;
 }
-/* Background blur từ thumbnail — giống web version */
 .mc-bg{
   position:absolute;inset:0;z-index:0;
   background-size:cover;background-position:center;
-  filter:blur(28px) brightness(.38) saturate(1.4);
-  transform:scale(1.12);
+  filter:blur(18px) brightness(.75) saturate(1.5);
+  transform:scale(1.25);
   opacity:0;transition:opacity .6s ease;
 }
 .mc-bg.show{opacity:1}
-/* Overlay tối nhẹ để bars nổi */
 .mc-vis::after{
   content:'';position:absolute;inset:0;z-index:1;
-  background:linear-gradient(to bottom,rgba(4,2,12,.25) 0%,rgba(4,2,12,.55) 100%);
+  background:linear-gradient(to bottom,rgba(4,2,12,.05) 0%,rgba(4,2,12,.25) 100%);
   pointer-events:none;
 }
-/* Hàng trên: thumb tròn + title area */
+/* FIX 2: mc-top đảo chiều — đĩa nhạc phải, waveform trái */
 .mc-top{
   display:flex;align-items:center;gap:11px;
-  padding:12px 14px 0 14px;position:relative;z-index:2;flex-shrink:0;
+  padding:12px 14px;position:relative;z-index:2;flex:1;
+  flex-direction:row-reverse;
 }
 .mc-thumb-wrap{
   width:72px;height:72px;border-radius:50%;overflow:hidden;flex-shrink:0;
@@ -934,16 +895,28 @@ ha-card{border-radius:20px;overflow:hidden;font-family:'Segoe UI',system-ui,sans
 .mc-thumb{width:100%;height:100%;object-fit:cover}
 .mc-thumb.spin{animation:sp 12s linear infinite}@keyframes sp{to{transform:rotate(360deg)}}
 .mc-thumb-fb{width:100%;height:100%;display:grid;place-items:center;background:rgba(109,40,217,.18);font-size:28px}
-/* Waveform area — full width, fills remaining space */
+/* FIX 2: waveform-wrap chiếm toàn bộ phần còn lại bên trái */
 .waveform-wrap{
-  flex:1;position:relative;z-index:2;display:flex;align-items:flex-end;
-  padding:0 10px 0 10px;overflow:hidden;min-height:0;
+  display:flex;flex-direction:column;align-items:flex-start;
+  flex:1;height:72px;overflow:hidden;position:relative;z-index:2;
 }
-.waveform{
-  display:flex;align-items:flex-end;justify-content:space-between;
-  width:100%;height:100%;gap:0;
+.waveform{display:flex;align-items:flex-end;justify-content:space-evenly;flex:1;width:100%}
+/* FIX 3: nút waveform style lớn hơn, dễ thấy */
+.wv-style-btn{
+  flex-shrink:0;width:28px;height:28px;border-radius:50%;
+  border:1px solid rgba(139,92,246,.45);
+  background:rgba(109,40,217,.25);
+  color:rgba(167,139,250,.95);
+  cursor:pointer;font-size:14px;
+  display:grid;place-items:center;
+  align-self:flex-start;
+  margin:0 0 4px 2px;
+  transition:all .15s;padding:0;line-height:1;
 }
-/* Progress bar nằm trong mc-vis, ở đáy */
+.wv-style-btn:hover{background:rgba(109,40,217,.5);border-color:rgba(139,92,246,.7);transform:scale(1.1)}
+.wv-col{display:flex;flex-direction:column;align-items:center;justify-content:flex-end;position:relative;flex:1;height:100%}
+.wv-bar{width:3px;flex-shrink:0;background:linear-gradient(to top,rgba(88,28,220,.7),rgba(167,139,250,.9));border-radius:2px 2px 1px 1px;will-change:height;height:3px;opacity:.9}
+.wv-ball{position:absolute;bottom:3px;width:5px;height:5px;border-radius:50%;background:#c4b5fd;box-shadow:0 0 4px rgba(167,139,250,.8);left:50%;transform:translateX(-50%);transition:bottom 0.05s linear;pointer-events:none}
 .mc-seek-wrap{
   position:relative;z-index:2;padding:4px 12px 10px 12px;flex-shrink:0;
 }
@@ -963,14 +936,6 @@ ha-card{border-radius:20px;overflow:hidden;font-family:'Segoe UI',system-ui,sans
   box-shadow:0 0 6px rgba(167,139,250,.7);opacity:0;transition:opacity .15s;pointer-events:none;
 }
 .mc-seek-bar:hover .mc-seek-thumb{opacity:1}
-/* Bars */
-.wv-bar{
-  flex:1;max-width:7px;min-width:2px;
-  background:linear-gradient(to top,rgba(88,28,220,.7),rgba(167,139,250,.9));
-  border-radius:2px 2px 1px 1px;will-change:height;
-  transition:height 0.04s linear;height:3px;opacity:.9;
-}
-/* ===== END UPDATED ===== */
 .progress-row{display:flex;align-items:center;gap:8px;margin-bottom:12px}
 .time-txt{font-size:10px;color:rgba(226,232,240,.55);min-width:32px;font-family:monospace}
 .time-txt.right{text-align:right}
@@ -997,7 +962,7 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;heigh
 .search-results{max-height:160px;overflow-y:auto}
 .search-results::-webkit-scrollbar{width:4px}
 .search-results::-webkit-scrollbar-thumb{background:rgba(139,92,246,.3);border-radius:999px}
-.result-item{display:flex;align-items:center;gap:8px;padding:7px 8px;border-radius:10px;cursor:pointer;border:1px solid transparent;transition:all .15s;margin-bottom:4px}
+.result-item{display:flex;align-items:center;gap:8px;padding:7px 8px;border-radius:10px;cursor:pointer;border:1px solid transparent;transition:all .15px;margin-bottom:4px}
 .result-item:hover{background:rgba(109,40,217,.2);border-color:rgba(139,92,246,.2)}
 .result-thumb{width:36px;height:36px;border-radius:8px;object-fit:cover;background:rgba(109,40,217,.2);flex-shrink:0;font-size:16px;display:grid;place-items:center}
 .result-info{flex:1;min-width:0}
@@ -1025,13 +990,11 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;heigh
 .sub-tabs{display:flex;gap:4px;margin-bottom:8px}
 .sub-tab{padding:5px 10px;border-radius:8px;cursor:pointer;font-size:10px;font-weight:700;border:1px solid rgba(148,163,184,.12);background:transparent;color:rgba(226,232,240,.5);transition:all .15s}
 .sub-tab.active{background:rgba(109,40,217,.3);border-color:rgba(139,92,246,.3);color:#c4b5fd}
-/* ===== UPDATED v6.1.4: EQ bands full-width with value labels ===== */
 .eq-container{display:flex;justify-content:space-evenly;align-items:flex-end;padding:8px 0;width:100%}
 .eq-band{display:flex;flex-direction:column;align-items:center;gap:4px;flex:1}
 .eq-band-val{font-size:10px;font-weight:700;color:#a78bfa;text-align:center;min-height:16px;line-height:16px}
 .eq-band input[type=range]{writing-mode:vertical-lr;direction:rtl;-webkit-appearance:slider-vertical;width:22px;height:95px;flex:none;padding:0}
 .eq-band label{font-size:9px;color:rgba(226,232,240,.4)}
-/* ===== END UPDATED ===== */
 .preset-row{display:flex;flex-wrap:wrap;gap:4px;justify-content:center;margin:6px 0}
 .preset-btn{padding:4px 10px;border-radius:8px;cursor:pointer;font-size:10px;font-weight:700;border:1px solid rgba(148,163,184,.12);background:rgba(2,6,23,.3);color:rgba(226,232,240,.5);transition:all .15s}
 .preset-btn:hover{background:rgba(109,40,217,.2);border-color:rgba(139,92,246,.2);color:#c4b5fd}
@@ -1107,7 +1070,7 @@ select.form-inp{cursor:pointer}
 .toast.error{border-color:rgba(239,68,68,.3);color:#fca5a5}
 .fx{display:flex}.aic{align-items:center}.jcb{justify-content:space-between}.g4{gap:4px}.g6{gap:6px}.g8{gap:8px}.mt6{margin-top:6px}.mt8{margin-top:8px}.mb6{margin-bottom:6px}.mb8{margin-bottom:8px}.f1{flex:1;min-width:0}.o5{opacity:.5}
 .hidden{display:none!important}
-@media(max-width:480px){.wrap{padding:10px 10px 8px}.title-text{font-size:14px}.version{font-size:9px}.badge-icon{width:28px;height:28px;font-size:13px}.tabs{padding:4px;gap:4px}.tab{font-size:10px;padding:7px 4px}.body{height:460px}.mc-thumb-wrap{width:70px;height:70px}.mc-vis{height:130px}.mc-title{font-size:13px}.ctrl-btn{width:34px;height:34px;font-size:13px}.ctrl-btn.play{width:46px;height:46px;font-size:18px}.msgs{height:200px}.bubble{font-size:11px}.toggle-left .tog-name{font-size:11px}.sw{width:38px;height:22px}.sw::after{width:14px;height:14px;top:3px;left:3px}.sw.on::after{left:19px}.rbtn{font-size:10px;padding:4px 8px}.eq-band input[type=range]{height:70px}.eq-band-val{font-size:9px}}
+@media(max-width:480px){.wrap{padding:10px 10px 8px}.title-text{font-size:14px}.badge-icon{width:28px;height:28px;font-size:13px}.tabs{padding:4px;gap:4px}.tab{font-size:10px;padding:7px 4px}.body{height:460px}.mc-thumb-wrap{width:60px;height:60px}.mc-vis{height:86px}.mc-title{font-size:13px}.ctrl-btn{width:34px;height:34px;font-size:13px}.ctrl-btn.play{width:46px;height:46px;font-size:18px}.msgs{height:200px}.bubble{font-size:11px}.toggle-left .tog-name{font-size:11px}.sw{width:38px;height:22px}.sw::after{width:14px;height:14px;top:3px;left:3px}.sw.on::after{left:19px}.rbtn{font-size:10px;padding:4px 8px}.eq-band input[type=range]{height:70px}.eq-band-val{font-size:9px}}
 </style>
 `;
     this._setConnDot(this._wsConnected);
@@ -1122,10 +1085,14 @@ select.form-inp{cursor:pointer}
     this._renderSystem(); this._renderAlarms();
   }
 
+  // ============================================================
+  // FIX 2: Layout đĩa nhạc phải — waveform + nút trái
+  // ============================================================
   _panelMedia(tab) {
-    // 40 waveform bars for full-width coverage
-    // 60 bars — web-style full width, bell curve envelope
-    let wvBars = ''; for (let i = 0; i < 60; i++) wvBars += `<div class="wv-bar" style="--i:${i}"></div>`;
+    let wvContent = '';
+    for (let i = 0; i < 25; i++) {
+      wvContent += `<div class="wv-col"><div class="wv-ball"></div><div class="wv-bar"></div></div>`;
+    }
     return `
 <div class="panel ${tab==="media"?"active":""}" id="p-media">
   <div class="media-card">
@@ -1141,20 +1108,17 @@ select.form-inp{cursor:pointer}
       </div>
     </div>
     <div class="mc-vis" id="mcVis">
-      <!-- Background blur từ thumbnail -->
       <div class="mc-bg" id="mcBg"></div>
-      <!-- Hàng trên: thumb tròn -->
       <div class="mc-top">
         <div class="mc-thumb-wrap">
           <img id="mediaThumb" class="mc-thumb" style="display:none" />
           <div id="thumbFallback" class="mc-thumb-fb">🎵</div>
         </div>
+        <div class="waveform-wrap" id="waveformWrap" style="display:none">
+          <button class="wv-style-btn" id="btnWaveStyle" title="Đổi kiểu hiệu ứng">⚬</button>
+          <div class="waveform" id="waveform">${wvContent}</div>
+        </div>
       </div>
-      <!-- Waveform full width -->
-      <div class="waveform-wrap">
-        <div class="waveform off" id="waveform">${wvBars}</div>
-      </div>
-      <!-- Seekbar trong mc-vis -->
       <div class="mc-seek-wrap">
         <div class="mc-seek-row">
           <span class="time-txt" id="posText">0:00</span>
@@ -1348,13 +1312,13 @@ select.form-inp{cursor:pointer}
 
     this.querySelectorAll(".tab").forEach(b => { b.onclick = () => {
       const newTab = b.dataset.tab;
-      if (newTab === this._activeTab) return; // không re-render nếu cùng tab
+      if (newTab === this._activeTab) return;
       this._activeTab = newTab;
       this._render(); this._bind();
-      // Lazy load — chỉ load data + start services cho tab vừa kích
       this._loadTab(newTab);
     }; });
 
+    this._on("#btnWaveStyle", () => this._toggleWaveStyle());
     this._on("#seekWrap", null, el => { el.onclick = e => { const m = this._state.media; if (!m.duration) return; const r = el.getBoundingClientRect(); const pos = Math.floor(m.duration * Math.max(0, Math.min(1, (e.clientX - r.left) / r.width))); m.position = pos; this._send({ action: "seek", position: pos }); this._updateProgressOnly(); }; });
     this._on("#btnPlayPause", () => {
       if (this._state.media.isPlaying) this._send({ action: "pause" });
@@ -1525,8 +1489,6 @@ select.form-inp{cursor:pointer}
 
     this._on("#btnAlarmAdd", () => this._showAlarmModal());
     this._on("#btnAlarmRefresh", () => this._send({ action: "alarm_list" }));
-
-    // Render ngay với state hiện có (không chờ server response)
     this._renderAlarms();
 
     this._on("#chatSend", () => this._sendChat());
@@ -1563,7 +1525,6 @@ select.form-inp{cursor:pointer}
     const v = this.querySelector(valId); if (v) v.textContent = displayVal !== undefined ? displayVal : rawVal;
   }
 
-  // ===== UPDATED v6.1.4: EQ bands with value labels at top =====
   _buildEqBands() {
     const c = this.querySelector("#eqBands"); if (!c) return;
     c.innerHTML = EQ_LABELS.map((f, i) => {
@@ -1578,7 +1539,6 @@ select.form-inp{cursor:pointer}
       this._sendSpk({ type: "set_eq_bandlevel", band: parseInt(inp.dataset.band), level: v });
     }; });
   }
-  // ===== END UPDATED =====
 
   _doSearch() {
     const q = (this.querySelector("#searchInp")?.value || "").trim(); if (!q) return;
@@ -1687,14 +1647,12 @@ select.form-inp{cursor:pointer}
     if (d.type === "live2d_model" || d.type === "live2d_get_model_result") { if (d.model) this._state.live2dModel = d.model; const sel = this.querySelector("#live2dSel"); if (sel && d.model) sel.value = d.model; return; }
     if (d.type === "alarm_list" || d.type === "alarm_list_result") { this._state.alarms = d.alarms || []; this._renderAlarms(); return; }
     if (d.type === "alarm_added") {
-      // Server trả về alarm object với field "id"
       if (d.alarm) { this._state.alarms.push(d.alarm); this._renderAlarms(); }
       else this._send({ action: "alarm_list" });
       this._toast(`✅ Đã thêm báo thức lúc ${d.alarm ? String(d.alarm.hour).padStart(2,'0')+':'+String(d.alarm.minute).padStart(2,'0') : ''}`, "success");
       return;
     }
     if (d.type === "alarm_edited") {
-      // alarm object dùng field "id"
       if (d.alarm) {
         const idx = this._state.alarms.findIndex(a => a.id === d.alarm.id);
         if (idx >= 0) this._state.alarms[idx] = d.alarm; else this._state.alarms.push(d.alarm);
@@ -1704,7 +1662,6 @@ select.form-inp{cursor:pointer}
       return;
     }
     if (d.type === "alarm_deleted") {
-      // Response không trả về id → dùng _pendingDeleteId đã track trước đó
       const delId = d.id ?? d.alarm_id ?? this._pendingDeleteId;
       this._pendingDeleteId = null;
       if (delId !== undefined && delId !== null) {
@@ -1717,13 +1674,11 @@ select.form-inp{cursor:pointer}
       return;
     }
     if (d.type === "alarm_toggled") {
-      // alarm object dùng field "id"
       if (d.alarm) {
         const idx = this._state.alarms.findIndex(a => a.id === d.alarm.id);
         if (idx >= 0) { this._state.alarms[idx].enabled = d.alarm.enabled; this._renderAlarms(); }
         else this._send({ action: "alarm_list" });
       } else {
-        // Không có data → reload list
         this._send({ action: "alarm_list" });
       }
       return;
@@ -1790,7 +1745,6 @@ select.form-inp{cursor:pointer}
     if (dur) dur.textContent = this._fmtTime(m.duration);
     const pct = m.duration > 0 ? Math.min(100, (m.position / m.duration) * 100) : 0;
     if (bar) bar.style.width = pct + "%";
-    // Update seek thumb position
     const thumb = this.querySelector("#seekThumb");
     if (thumb) thumb.style.setProperty("--spct", pct + "%");
   }
@@ -1808,17 +1762,23 @@ select.form-inp{cursor:pointer}
     const pp = this.querySelector("#btnPlayPause"); if (pp) pp.textContent = m.isPlaying ? "⏸" : "▶";
     const rp = this.querySelector("#btnRepeat"); if (rp) rp.classList.toggle("active-btn", !!m.repeat);
     const sh = this.querySelector("#btnShuffle"); if (sh) sh.classList.toggle("active-btn", !!m.autoNext);
-    const wv = this.querySelector("#waveform"); if (wv) wv.classList.toggle("off", !m.isPlaying);
-    if (wv) this._waveBars = wv.querySelectorAll('.wv-bar');
-    // Cập nhật background blur từ thumbnail — giống web version
+    const ww = this.querySelector("#waveformWrap");
+    if (ww) {
+      ww.style.display = m.isPlaying ? "flex" : "none";
+      if (m.isPlaying) {
+        const wv = this.querySelector('#waveform');
+        if (wv) {
+          this._waveBars  = wv.querySelectorAll('.wv-bar');
+          this._waveBalls = wv.querySelectorAll('.wv-ball');
+        }
+      }
+    }
+    const styleBtn = this.querySelector('#btnWaveStyle');
+    if (styleBtn) styleBtn.textContent = (this._waveStyle || 'ball') === 'classic' ? '≡' : '⚬';
     const mcBg = this.querySelector("#mcBg");
     if (mcBg) {
-      if (m.thumb) {
-        mcBg.style.backgroundImage = `url('${m.thumb}')`;
-        mcBg.classList.add("show");
-      } else {
-        mcBg.classList.remove("show");
-      }
+      if (m.thumb) { mcBg.style.backgroundImage = `url("${m.thumb}")`; mcBg.classList.add("show"); }
+      else { mcBg.style.backgroundImage = ''; mcBg.classList.remove("show"); }
     }
     this._updateProgressOnly();
   }
@@ -1955,14 +1915,12 @@ select.form-inp{cursor:pointer}
     if (cb) cb.style.width = s.cpu + "%"; if (rb) rb.style.width = s.ram + "%";
   }
 
-  // ===== UPDATED v6.1.4: render EQ band values =====
   _renderEqBands() {
     this._state.eqBands.forEach((v, i) => {
       const inp = this.querySelector(`input[data-band="${i}"]`); if (inp) inp.value = v;
       const vl = this.querySelector(`#eqVal${i}`); if (vl) vl.textContent = v > 0 ? `+${v}` : `${v}`;
     });
   }
-  // ===== END UPDATED =====
 
   _renderPremium() {
     this._renderCustomAi();
@@ -1978,7 +1936,6 @@ select.form-inp{cursor:pointer}
     const rpMap = { daily: 'Hàng ngày', weekly: 'Hàng tuần', none: 'Một lần' };
     const dayNames = {1:'CN',2:'T2',3:'T3',4:'T4',5:'T5',6:'T6',7:'T7'};
 
-    // Dùng a.id (unique) làm key cho data attribute thay vì index mảng
     el.innerHTML = als.map(a => {
       const t = `${String(a.hour).padStart(2,'0')}:${String(a.minute).padStart(2,'0')}`;
       const daysStr = Array.isArray(a.selected_days) && a.selected_days.length
@@ -2001,7 +1958,6 @@ select.form-inp{cursor:pointer}
 </div>`;
     }).join("");
 
-    // Event delegation trên container — không bị mất khi rebuild innerHTML
     if (!el._alarmDelegated) {
       el._alarmDelegated = true;
       el.addEventListener('click', (e) => {
@@ -2081,7 +2037,7 @@ select.form-inp{cursor:pointer}
       const rpt = div.querySelector("#alRpt").value;
       const days = rpt === "weekly" ? Array.from(div.querySelectorAll(".al-day-cb:checked")).map(c => parseInt(c.value)) : undefined;
       const data = { action: isEdit ? "alarm_edit" : "alarm_add", hour: h, minute: m, repeat: rpt, label: div.querySelector("#alLabel").value.trim(), volume: parseInt(div.querySelector("#alVol").value) };
-      if (isEdit) { data.alarm_id = al.id; data.enabled = al.enabled; }  // alarm_edit cần alarm_id + enabled
+      if (isEdit) { data.alarm_id = al.id; data.enabled = al.enabled; }
       const yt = div.querySelector("#alYt").value.trim(); if (yt) data.youtube_song_name = yt;
       if (days) data.selected_days = days;
       this._send(data); div.remove();
@@ -2099,4 +2055,4 @@ window.customCards.push({
   preview: false
 });
 
-console.log("%c AI BOX WebUI Card v6.2.0 loaded", "color:#a78bfa;font-weight:bold");
+console.log("%c AI BOX WebUI Card v6.3.1 loaded", "color:#a78bfa;font-weight:bold");
